@@ -57,9 +57,7 @@ console.log("Loaded ${artifacts.prebuilt.package} through ${artifacts.public.pac
   await writeFile(testPath, testSource.trimStart(), "utf8");
 
   const electronExecutable = require("electron");
-  const electronArgs = process.platform === "linux"
-    ? ["--no-sandbox", testPath]
-    : [testPath];
+  const electronArgs = [testPath];
   const result = spawnSync(electronExecutable, electronArgs, {
     cwd: consumerDir,
     stdio: "inherit",

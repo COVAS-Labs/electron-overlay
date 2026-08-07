@@ -43,7 +43,7 @@ try {
 console.log("Loaded the installed native addon through findWindow for ${targetId}.");
 `.trimStart(), "utf8");
   const consumerRequire = createRequire(resolve(consumerDir, "package.json"));
-  const electron = spawnSync(consumerRequire("electron"), process.platform === "linux" ? ["--no-sandbox", testPath] : [testPath], {
+  const electron = spawnSync(consumerRequire("electron"), [testPath], {
     cwd: consumerDir,
     stdio: "inherit",
     env: { ...process.env, ELECTRON_RUN_AS_NODE: "1" }

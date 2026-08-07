@@ -49,7 +49,7 @@ try { overlay.findWindow({ title: "__electron_overlay_release_validation__", mat
 console.log("Loaded exact release tarballs for ${targetId}.");
 `.trimStart(), "utf8");
   const electronExecutable = require("electron");
-  const result = spawnSync(electronExecutable, process.platform === "linux" ? ["--no-sandbox", testPath] : [testPath], {
+  const result = spawnSync(electronExecutable, [testPath], {
     cwd: consumerDir,
     stdio: "inherit",
     env: { ...process.env, ELECTRON_RUN_AS_NODE: "1" }
