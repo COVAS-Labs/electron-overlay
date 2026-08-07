@@ -18,7 +18,7 @@ jobs:
           cache: npm
       - name: Install X11 headers
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libx11-dev libxfixes-dev xvfb
+        run: sudo apt-get update && sudo apt-get install -y libx11-dev libxext-dev libxfixes-dev xvfb
       - run: npm ci
       - run: npm test
       - run: npm run build:addon
