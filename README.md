@@ -4,6 +4,10 @@ Window policy for Electron overlays on Linux, Windows, and macOS. The public pac
 
 Electron creates the transparent Chromium surface. Win32, macOS, and X11 use the native addon for window policy. Native Wayland uses a separate compatibility backend that applies the supported policy through Electron without assuming access to global windows, coordinates, or X11 handles.
 
+## Supported release platforms
+
+Prebuilt Electron addons are published for Linux x64, Windows x64, and macOS arm64. Other operating-system and architecture combinations are not currently released and fail with an explicit unsupported-prebuilt error. Linux x64 supports X11/XWayland and the Electron compatibility backend for native Wayland.
+
 ## Development
 
 ```sh

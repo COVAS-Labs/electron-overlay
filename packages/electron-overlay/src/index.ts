@@ -1,5 +1,6 @@
 import { createRequire } from "node:module";
-import { dirname, resolve } from "node:path";
+import { existsSync } from "node:fs";
+import { basename, dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 export interface NativeRect {
@@ -111,17 +112,14 @@ interface OverlayBackend {
   findWindow(query: WindowQuery): ParentInfo | null;
 }
 
-const PREBUILT_PACKAGES: Partial<Record<NodeJS.Platform, Partial<Record<NodeJS.Architecture, string>>>> = {
+export const PREBUILT_PACKAGES: Partial<Record<NodeJS.Platform, Partial<Record<NodeJS.Architecture, string>>>> = {
   darwin: {
-    arm64: "@covas-labs/electron-overlay-prebuilt-darwin-arm64",
-    x64: "@covas-labs/electron-overlay-prebuilt-darwin-x64"
+    arm64: "@covas-labs/electron-overlay-prebuilt-darwin-arm64"
   },
   linux: {
-    arm64: "@covas-labs/electron-overlay-prebuilt-linux-arm64",
     x64: "@covas-labs/electron-overlay-prebuilt-linux-x64"
   },
   win32: {
-    arm64: "@covas-labs/electron-overlay-prebuilt-win32-arm64",
     x64: "@covas-labs/electron-overlay-prebuilt-win32-x64"
   }
 };
@@ -211,26 +209,44 @@ function loadAddon(): NativeAddon {
   const require = createRequire(import.meta.url);
   const applicationRequire = createRequire(resolve(process.cwd(), "package.json"));
   const currentDir = dirname(fileURLToPath(import.meta.url));
-  const localPath = resolve(currentDir, "..", "..", "native-addon", "build", "Release", "x11_overlay.node");
+  const packageDir = resolve(currentDir, "..");
+  const workspacePackagesDir = resolve(packageDir, "..");
+  const nativeWorkspaceDir = resolve(workspacePackagesDir, "native-addon");
+  const localPath = resolve(nativeWorkspaceDir, "build", "Release", "x11_overlay.node");
   const prebuiltPackage = PREBUILT_PACKAGES[process.platform]?.[process.arch];
+  const errors: string[] = [];
 
-  try {
-    addon = require(localPath) as NativeAddon;
-  } catch (localError) {
-    if (!prebuiltPackage) {
-      throw new Error(`No native overlay prebuilt is available for ${process.platform}-${process.arch}. Local addon: ${String(localError)}`);
-    }
+  if (prebuiltPackage) {
     try {
       addon = require(prebuiltPackage) as NativeAddon;
     } catch (packageError) {
+      errors.push(`package: ${String(packageError)}`);
       try {
         addon = applicationRequire(prebuiltPackage) as NativeAddon;
       } catch (applicationError) {
-        throw new Error(
-          `Failed to load the native overlay addon for ${process.platform}-${process.arch}. Local: ${String(localError)}; package: ${String(packageError)}; application: ${String(applicationError)}`
-        );
+        errors.push(`application: ${String(applicationError)}`);
       }
     }
+  }
+
+  const isWorkspaceDevelopment = basename(packageDir) === "electron-overlay"
+    && basename(workspacePackagesDir) === "packages"
+    && existsSync(resolve(nativeWorkspaceDir, "package.json"));
+  if (!addon && isWorkspaceDevelopment) {
+    try {
+      addon = require(localPath) as NativeAddon;
+    } catch (localError) {
+      errors.push(`workspace: ${String(localError)}`);
+    }
+  }
+
+  if (!addon) {
+    if (!prebuiltPackage) {
+      throw new Error(`No native overlay prebuilt is available for ${process.platform}-${process.arch}.`);
+    }
+    throw new Error(
+      `Failed to load the native overlay addon for ${process.platform}-${process.arch}. ${errors.join("; ")}`
+    );
   }
   return addon;
 }

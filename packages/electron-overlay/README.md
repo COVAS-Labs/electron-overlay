@@ -2,6 +2,10 @@
 
 A policy controller for transparent Electron overlay windows on Linux, Windows, and macOS. Linux X11/XWayland uses the native addon; native Wayland uses an Electron compatibility backend with an explicit, smaller capability set.
 
+## Supported platforms
+
+The published prebuilt packages support Linux x64, Windows x64, and macOS arm64. Other platform and architecture combinations do not currently have a released native addon. Linux x64 supports X11/XWayland and the Electron compatibility backend for native Wayland.
+
 ## Usage
 
 Create the `BrowserWindow` without bypassing the window manager:
