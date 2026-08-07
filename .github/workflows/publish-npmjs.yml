@@ -1,0 +1,91 @@
+name: Publish To npmjs
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      package_version: ${{ steps.validate.outputs.package_version }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+      - id: validate
+        shell: bash
+        run: |
+          package_version="${GITHUB_REF_NAME#v}"
+          source_version=$(node -p "require('./packages/electron-overlay/package.json').version")
+          if [[ ! "$package_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || [[ "$source_version" != "$package_version" ]]; then
+            echo "Tag $GITHUB_REF_NAME must be stable semver and match package version $source_version" >&2
+            exit 1
+          fi
+          echo "package_version=$package_version" >> "$GITHUB_OUTPUT"
+
+  publish-prebuilt:
+    needs: version
+    name: Publish Prebuilt (${{ matrix.platform_id }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            platform_id: linux-x64
+          - os: windows-2022
+            platform_id: win32-x64
+          - os: macos-latest
+            platform_id: darwin-arm64
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: npm
+          registry-url: https://registry.npmjs.org
+      - run: npm install -g npm@latest
+      - name: Install Linux native dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libx11-dev libxext-dev libxfixes-dev
+      - run: npm ci
+      - run: npm run rebuild:electron
+      - run: node ./tools/prepare-prebuilt-package.mjs --package-version=${{ needs.version.outputs.package_version }}
+      - name: Publish prebuilt package
+        working-directory: artifacts/publish/prebuilt-${{ matrix.platform_id }}/package
+        run: npm publish --provenance --access public
+      - uses: actions/upload-artifact@v7
+        with:
+          name: npm-prebuilt-${{ matrix.platform_id }}
+          path: artifacts/publish/prebuilt-${{ matrix.platform_id }}/package/**
+          if-no-files-found: error
+
+  publish-public:
+    needs: [version, publish-prebuilt]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: npm
+          registry-url: https://registry.npmjs.org
+      - run: npm install -g npm@latest
+      - run: npm ci
+      - run: npm run build
+      - run: node ./tools/prepare-public-package.mjs --package-version=${{ needs.version.outputs.package_version }}
+      - name: Publish public package
+        working-directory: artifacts/publish/public/package
+        run: npm publish --provenance --access public
+      - uses: actions/upload-artifact@v7
+        with:
+          name: npm-electron-overlay-public-package
+          path: artifacts/publish/public/package/**
+          if-no-files-found: error
