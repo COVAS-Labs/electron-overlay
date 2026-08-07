@@ -41,11 +41,13 @@ app.whenReady().then(() => {
   overlay.setClickThrough(true);
   overlay.setAlwaysOnTop(false);
   overlay.setAlwaysOnTop(true);
+  window.showInactive();
   overlay.reapply();
 
   const state = overlay.getState();
   if (state.closed || state.bounds.width !== 320 || state.bounds.height !== 180) {
-    throw new Error(`Unexpected overlay state: ${JSON.stringify(state)}`);
+    throw new Error(`Unexpected overlay state: ${JSON.stringify(state, (_key, value) =>
+      typeof value === "bigint" ? value.toString() : value)}`);
   }
 
   overlay.close();
