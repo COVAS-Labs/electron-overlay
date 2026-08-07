@@ -10,6 +10,7 @@
     "build:addon": "npm run build:addon --workspace @covas-labs/electron-overlay-native-addon",
     "rebuild:electron": "npm run rebuild:electron --workspace @covas-labs/electron-overlay-native-addon",
     "test:electron": "electron ./tests/electron-smoke.mjs",
+    "test:electron:no-sandbox": "electron --no-sandbox ./tests/electron-smoke.mjs",
     "test": "npm run build && node --test ./tests/*.test.mjs"
   },
   "engines": {
