@@ -1,0 +1,32 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - name: Install X11 headers
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libx11-dev libxfixes-dev xvfb
+      - run: npm ci
+      - run: npm test
+      - run: npm run build:addon
+      - run: npm run rebuild:electron
+      - run: node ./node_modules/electron/install.js
+      - name: Electron smoke test
+        if: runner.os != 'Linux'
+        run: npm run test:electron
+      - name: Electron smoke test (Xvfb)
+        if: runner.os == 'Linux'
+        run: xvfb-run -a npm run test:electron

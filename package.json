@@ -1,0 +1,26 @@
+{
+  "name": "electron-overlay-workspace",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "build": "npm run build --workspace @covas-labs/electron-overlay",
+    "build:addon": "npm run build:addon --workspace @covas-labs/electron-overlay-native-addon",
+    "rebuild:electron": "npm run rebuild:electron --workspace @covas-labs/electron-overlay-native-addon",
+    "test:electron": "electron ./tests/electron-smoke.mjs",
+    "test": "npm run build && node --test ./tests/*.test.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "devDependencies": {
+    "@electron/rebuild": "^4.0.1",
+    "@types/node": "^24.0.0",
+    "electron": "^43.3.0",
+    "node-addon-api": "^8.3.1",
+    "node-gyp": "^11.4.0",
+    "typescript": "^5.9.2"
+  }
+}

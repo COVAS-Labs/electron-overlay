@@ -1,0 +1,12 @@
+{
+  "name": "@covas-labs/electron-overlay-native-addon",
+  "private": true,
+  "scripts": {
+    "install": "node -e \"console.log('Skipping implicit native rebuild during install.')\"",
+    "build:addon": "node ../../tools/build-native-addon.mjs",
+    "rebuild:electron": "node ../../tools/rebuild-electron-addon.mjs"
+  },
+  "dependencies": {
+    "node-addon-api": "^8.3.1"
+  }
+}
