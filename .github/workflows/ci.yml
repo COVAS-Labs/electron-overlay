@@ -5,18 +5,50 @@ on:
   pull_request:
 
 jobs:
-  build:
+  unit:
+    name: Unit (Node ${{ matrix.node }})
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-2022, macos-latest]
+        node: [20, 24]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v6
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+      - run: npm ci
+      - run: npm test
+
+  native:
+    name: Native build + smoke (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux x64 (Xvfb)
+            os: ubuntu-24.04
+            architecture: x64
+            smoke: xvfb-run -a npm run test:electron:no-sandbox
+          - name: Windows x64
+            os: windows-2022
+            architecture: x64
+            smoke: npm run test:electron
+          - name: macOS arm64
+            os: macos-15
+            architecture: arm64
+            smoke: npm run test:electron
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v6
         with:
           node-version: 24
+          architecture: ${{ matrix.architecture }}
           cache: npm
+      - name: Verify runner architecture
+        run: node -e "if (process.arch !== '${{ matrix.architecture }}') throw new Error('Expected ${{ matrix.architecture }}, got ' + process.arch)"
       - name: Install X11 headers
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libx11-dev libxext-dev libxfixes-dev xvfb
@@ -26,8 +58,29 @@ jobs:
       - run: npm run rebuild:electron
       - run: node ./node_modules/electron/install.js
       - name: Electron smoke test
-        if: runner.os != 'Linux'
-        run: npm run test:electron
-      - name: Electron smoke test (Xvfb)
-        if: runner.os == 'Linux'
-        run: xvfb-run -a npm run test:electron:no-sandbox
+        run: ${{ matrix.smoke }}
+
+  wayland:
+    name: Native Wayland smoke (Weston)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: npm
+      - name: Install Weston
+        run: sudo apt-get update && sudo apt-get install -y weston wayland-utils
+      - run: npm ci
+      - run: npm run build
+      - name: Electron smoke test (native Wayland)
+        run: npm run test:electron:wayland:weston
+        env:
+          WESTON_LOG_DIR: ${{ runner.temp }}/wayland-smoke-logs
+      - name: Upload Wayland smoke logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: wayland-smoke-logs
+          path: ${{ runner.temp }}/wayland-smoke-logs
+          if-no-files-found: warn

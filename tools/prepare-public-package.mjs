@@ -2,6 +2,8 @@ import { cp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { prebuiltPackageName, RELEASE_TARGETS } from "./release-targets.mjs";
+
 function parseArgs(argv) {
   return Object.fromEntries(argv.filter((arg) => arg.startsWith("--")).map((arg) => {
     const [key, ...parts] = arg.slice(2).split("=");
@@ -26,16 +28,15 @@ await rm(packageDir, { recursive: true, force: true });
 await mkdir(packageDir, { recursive: true });
 await cp(join(sourceDir, "dist"), join(packageDir, "dist"), { recursive: true, force: true });
 await cp(join(sourceDir, "README.md"), join(packageDir, "README.md"), { force: true });
+await cp(join(repoRoot, "LICENSE"), join(packageDir, "LICENSE"), { force: true });
 
 const publishManifest = {
   ...sourceManifest,
   name: `@${ownerScope}/electron-overlay`,
   version: packageVersion,
-  optionalDependencies: {
-    [`@${ownerScope}/electron-overlay-prebuilt-darwin-arm64`]: packageVersion,
-    [`@${ownerScope}/electron-overlay-prebuilt-linux-x64`]: packageVersion,
-    [`@${ownerScope}/electron-overlay-prebuilt-win32-x64`]: packageVersion
-  },
+  license: "MIT",
+  optionalDependencies: Object.fromEntries(RELEASE_TARGETS.map((target) =>
+    [prebuiltPackageName(ownerScope, target), packageVersion])),
   publishConfig: { registry, access }
 };
 delete publishManifest.scripts;

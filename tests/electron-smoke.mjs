@@ -2,6 +2,16 @@ import { app, BrowserWindow, screen } from "electron";
 
 import { configure, displayToNativeRect } from "../packages/electron-overlay/dist/index.js";
 
+const expectedBackend = {
+  darwin: "macos",
+  linux: "x11",
+  win32: "win32"
+}[process.platform];
+
+if (!expectedBackend) {
+  throw new Error(`Unsupported smoke test platform: ${process.platform}`);
+}
+
 if (process.platform === "linux") {
   app.commandLine.appendSwitch("ozone-platform", "x11");
 }
@@ -28,7 +38,8 @@ app.whenReady().then(() => {
     show: false
   });
 
-  const overlay = configure(window.getNativeWindowHandle(), {
+  const overlay = configure(window, {
+    backend: process.platform === "linux" ? "x11" : "auto",
     bounds: { ...bounds, width: 320, height: 180 },
     position: "bounds",
     clickThrough: true,
@@ -36,6 +47,11 @@ app.whenReady().then(() => {
     preserveCompositing: true
   });
   stage = "exercising the native controller";
+
+  const capabilities = overlay.getCapabilities();
+  if (capabilities.backend !== expectedBackend) {
+    throw new Error(`Expected ${expectedBackend} backend, got ${capabilities.backend}.`);
+  }
 
   overlay.setClickThrough(false);
   overlay.setClickThrough(true);
