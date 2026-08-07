@@ -28,7 +28,8 @@ app.whenReady().then(() => {
     show: false
   });
 
-  const overlay = configure(window.getNativeWindowHandle(), {
+  const overlay = configure(window, {
+    backend: process.platform === "linux" ? "x11" : "auto",
     bounds: { ...bounds, width: 320, height: 180 },
     position: "bounds",
     clickThrough: true,

@@ -1,6 +1,6 @@
 # @covas-labs/electron-overlay
 
-A native policy controller for transparent Electron overlay windows on Linux X11/XWayland, Windows, and macOS.
+A policy controller for transparent Electron overlay windows on Linux, Windows, and macOS. Linux X11/XWayland uses the native addon; native Wayland uses an Electron compatibility backend with an explicit, smaller capability set.
 
 ## Usage
 
@@ -8,9 +8,14 @@ Create the `BrowserWindow` without bypassing the window manager:
 
 ```js
 import { BrowserWindow, screen } from 'electron';
-import { configure, displayToNativeRect } from '@covas-labs/electron-overlay';
+import {
+  configure,
+  displayToNativeRect,
+  displayToOverlayRect
+} from '@covas-labs/electron-overlay';
 
 const display = screen.getPrimaryDisplay();
+const backend = 'auto';
 const window = new BrowserWindow({
   x: 0,
   y: 0,
@@ -24,8 +29,9 @@ const window = new BrowserWindow({
   webPreferences: { preload: overlayPreloadPath }
 });
 
-const overlay = configure(window.getNativeWindowHandle(), {
-  bounds: displayToNativeRect(display),
+const overlay = configure(window, {
+  backend,
+  bounds: displayToOverlayRect(display, window, backend),
   parent: { title: 'Elite - Dangerous', match: 'contains' },
   position: 'bounds',
   clickThrough: true,
@@ -41,7 +47,18 @@ overlay.reapply();
 window.on('closed', () => overlay.close());
 ```
 
-For one-time parent sizing, configure with `position: 'parent'`. If the target is not running yet, attach it later without moving the overlay:
+Passing the `BrowserWindow` lets `auto` select `wayland-electron` in a native Wayland session. The legacy buffer form remains supported for native backends:
+
+```js
+const overlay = configure(window.getNativeWindowHandle(), {
+  bounds: displayToNativeRect(display),
+  position: 'bounds'
+});
+```
+
+Buffer targets always select the platform addon in `auto` mode for backward compatibility. If the application passes a `BrowserWindow` and forces X11 with `app.commandLine.appendSwitch('ozone-platform', 'x11')`, use `backend: 'x11'` because appended Electron switches are not visible through Node's `process.argv`.
+
+For one-time parent sizing on a backend that reports `externalParent`, configure with `position: 'parent'`. If the target is not running yet, attach it later without moving the overlay:
 
 ```js
 overlay.attachParent(
@@ -51,6 +68,36 @@ overlay.attachParent(
 ```
 
 `attachParent()` returns `null` when no mapped matching client exists. Matching defaults to case-insensitive `contains`; active matches win, followed by the topmost matching client.
+
+On `wayland-electron`, `position: 'parent'` is rejected, `attachParent()` returns `null`, and `useParentBounds()` returns `false`. A parent query cannot identify an arbitrary external Wayland surface without compositor cooperation.
+
+## Capabilities
+
+```ts
+const capabilities = overlay.getCapabilities();
+```
+
+The result reports:
+
+```ts
+interface OverlayCapabilities {
+  backend:
+    | 'win32'
+    | 'macos'
+    | 'x11'
+    | 'wayland-electron';
+  clickThrough: boolean;
+  aboveFullscreen: boolean;
+  externalParent: boolean;
+  parentDiscovery: boolean;
+  globalPositioning: boolean;
+  boundsCoordinateSpace: 'native-pixels' | 'electron-screen';
+}
+```
+
+`getCapabilities(window, backend)` can inspect a backend before creating an overlay. `displayToOverlayRect(display, window, backend)` returns bounds in the same backend and coordinate space that `configure(window, { backend })` will use. Wayland Electron bounds use Electron screen coordinates; their global `x` and `y` are advisory because the compositor controls top-level placement.
+
+The compatibility backend reports `aboveFullscreen: false`, `externalParent: false`, `parentDiscovery: false`, and `globalPositioning: false`. It does not emulate X11's `WM_TRANSIENT_FOR`, restacking, or EWMH policy.
 
 ## Controller API
 
@@ -63,6 +110,7 @@ setClickThrough(enabled): void
 setAlwaysOnTop(enabled): void
 reapply(): void
 getState(): OverlayState
+getCapabilities(): OverlayCapabilities
 close(): void
 ```
 
