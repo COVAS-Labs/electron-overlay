@@ -7,85 +7,309 @@ on:
 
 permissions:
   contents: read
-  id-token: write
+
+concurrency:
+  group: npm-release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  NODE_VERSION: "24"
+  NPM_VERSION: "11.6.2"
+  NPM_REGISTRY: https://registry.npmjs.org
 
 jobs:
   version:
-    runs-on: ubuntu-latest
+    name: Validate release tag
+    runs-on: ubuntu-24.04
     outputs:
       package_version: ${{ steps.validate.outputs.package_version }}
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-node@v6
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
-          node-version: 24
+          fetch-depth: 0
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: ${{ env.NODE_VERSION }}
       - id: validate
-        shell: bash
-        run: |
-          package_version="${GITHUB_REF_NAME#v}"
-          source_version=$(node -p "require('./packages/electron-overlay/package.json').version")
-          if [[ ! "$package_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || [[ "$source_version" != "$package_version" ]]; then
-            echo "Tag $GITHUB_REF_NAME must be stable semver and match package version $source_version" >&2
-            exit 1
-          fi
-          echo "package_version=$package_version" >> "$GITHUB_OUTPUT"
+        name: Validate tag, version, and commit
+        run: node ./tools/validate-release-context.mjs
 
-  publish-prebuilt:
+  build-public:
+    name: Build public tarball
     needs: version
-    name: Publish Prebuilt (${{ matrix.platform_id }})
-    runs-on: ${{ matrix.os }}
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - run: npm install --global npm@${{ env.NPM_VERSION }}
+      - run: npm ci
+      - run: npm run build
+      - run: node ./tools/prepare-public-package.mjs --package-version=${{ needs.version.outputs.package_version }}
+      - name: Pack immutable public artifact
+        run: npm run release:pack -- --kind=public --package-version=${{ needs.version.outputs.package_version }} --output-dir=artifacts/release
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: npm-public-${{ needs.version.outputs.package_version }}
+          path: artifacts/release/*
+          if-no-files-found: error
+          retention-days: 30
+
+  build-prebuilt:
+    name: Build prebuilt (${{ matrix.target }})
+    needs: version
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
-            platform_id: linux-x64
+          - os: ubuntu-24.04
+            platform: linux
+            architecture: x64
+            target: linux-x64
           - os: windows-2022
-            platform_id: win32-x64
-          - os: macos-latest
-            platform_id: darwin-arm64
+            platform: win32
+            architecture: x64
+            target: win32-x64
+          - os: macos-15
+            platform: darwin
+            architecture: arm64
+            target: darwin-arm64
+    runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-node@v6
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
-          node-version: 24
+          node-version: ${{ env.NODE_VERSION }}
+          architecture: ${{ matrix.architecture }}
           cache: npm
-          registry-url: https://registry.npmjs.org
-      - run: npm install -g npm@latest
+      - run: npm install --global npm@${{ env.NPM_VERSION }}
+      - name: Assert runner target
+        env:
+          EXPECTED_TARGET: ${{ matrix.target }}
+        run: node --input-type=module -e "import { getReleaseTarget, releaseTargetId } from './tools/release-targets.mjs'; const actual = releaseTargetId(getReleaseTarget()); if (actual !== process.env.EXPECTED_TARGET) throw new Error('Expected ' + process.env.EXPECTED_TARGET + ', got ' + actual)"
       - name: Install Linux native dependencies
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libx11-dev libxext-dev libxfixes-dev
       - run: npm ci
       - run: npm run rebuild:electron
       - run: node ./tools/prepare-prebuilt-package.mjs --package-version=${{ needs.version.outputs.package_version }}
-      - name: Publish prebuilt package
-        working-directory: artifacts/publish/prebuilt-${{ matrix.platform_id }}/package
-        run: npm publish --provenance --access public
-      - uses: actions/upload-artifact@v7
+      - name: Pack immutable prebuilt artifact
+        run: npm run release:pack -- --kind=prebuilt --package-version=${{ needs.version.outputs.package_version }} --output-dir=artifacts/release
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: npm-prebuilt-${{ matrix.platform_id }}
-          path: artifacts/publish/prebuilt-${{ matrix.platform_id }}/package/**
+          name: npm-prebuilt-${{ matrix.target }}-${{ needs.version.outputs.package_version }}
+          path: artifacts/release/*
           if-no-files-found: error
+          retention-days: 30
+
+  test-tarballs:
+    name: Test downloaded tarballs (${{ matrix.target }})
+    needs: [version, build-public, build-prebuilt]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            platform: linux
+            architecture: x64
+            target: linux-x64
+          - os: windows-2022
+            platform: win32
+            architecture: x64
+            target: win32-x64
+          - os: macos-15
+            platform: darwin
+            architecture: arm64
+            target: darwin-arm64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          architecture: ${{ matrix.architecture }}
+          cache: npm
+      - run: npm install --global npm@${{ env.NPM_VERSION }}
+      - run: npm ci
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          name: npm-public-${{ needs.version.outputs.package_version }}
+          path: artifacts/download
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          name: npm-prebuilt-${{ matrix.target }}-${{ needs.version.outputs.package_version }}
+          path: artifacts/download
+      - name: Test exact downloaded tarballs
+        env:
+          EXPECTED_TARGET: ${{ matrix.target }}
+        run: npm run release:test-tarballs -- --artifact-dir=artifacts/download --package-version=${{ needs.version.outputs.package_version }}
+
+  ci-gate:
+    name: Require successful CI for release commit
+    needs: test-tarballs
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - name: Wait for successful CI workflow
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          EXPECTED_CI_WORKFLOW: ci.yml
+        run: node ./tools/wait-for-ci.mjs
+
+  publish-prebuilts:
+    name: Publish and verify prebuilts
+    needs: [version, ci-gate]
+    runs-on: ubuntu-24.04
+    environment: npm
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          registry-url: ${{ env.NPM_REGISTRY }}
+      - run: npm install --global npm@${{ env.NPM_VERSION }}
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          pattern: npm-prebuilt-*-${{ needs.version.outputs.package_version }}
+          path: artifacts/download
+          merge-multiple: true
+      - name: Publish or verify all prebuilts
+        env:
+          EXPECTED_REPOSITORY: ${{ github.server_url }}/${{ github.repository }}
+          EXPECTED_WORKFLOW: .github/workflows/publish-npmjs.yml
+          EXPECTED_TAG: ${{ github.ref_name }}
+          EXPECTED_COMMIT: ${{ github.sha }}
+        run: npm run release:npm -- publish --artifact-dir=artifacts/download --kind=prebuilt --package-version=${{ needs.version.outputs.package_version }}
+
+  verify-prebuilts:
+    name: Verify prebuilt registry state
+    needs: [version, publish-prebuilts]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          registry-url: ${{ env.NPM_REGISTRY }}
+      - run: npm install --global npm@${{ env.NPM_VERSION }}
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          pattern: npm-prebuilt-*-${{ needs.version.outputs.package_version }}
+          path: artifacts/download
+          merge-multiple: true
+      - name: Verify all prebuilt digests and provenance
+        env:
+          EXPECTED_REPOSITORY: ${{ github.server_url }}/${{ github.repository }}
+          EXPECTED_WORKFLOW: .github/workflows/publish-npmjs.yml
+          EXPECTED_TAG: ${{ github.ref_name }}
+          EXPECTED_COMMIT: ${{ github.sha }}
+        run: npm run release:npm -- verify --artifact-dir=artifacts/download --kind=prebuilt --package-version=${{ needs.version.outputs.package_version }}
 
   publish-public:
-    needs: [version, publish-prebuilt]
-    runs-on: ubuntu-latest
+    name: Publish and verify public package
+    needs: [version, verify-prebuilts]
+    runs-on: ubuntu-24.04
+    environment: npm
+    permissions:
+      contents: read
+      id-token: write
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-node@v6
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
-          node-version: 24
+          node-version: ${{ env.NODE_VERSION }}
+          registry-url: ${{ env.NPM_REGISTRY }}
+      - run: npm install --global npm@${{ env.NPM_VERSION }}
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          name: npm-public-${{ needs.version.outputs.package_version }}
+          path: artifacts/download
+      - name: Publish or verify public package
+        env:
+          EXPECTED_REPOSITORY: ${{ github.server_url }}/${{ github.repository }}
+          EXPECTED_WORKFLOW: .github/workflows/publish-npmjs.yml
+          EXPECTED_TAG: ${{ github.ref_name }}
+          EXPECTED_COMMIT: ${{ github.sha }}
+        run: npm run release:npm -- publish --artifact-dir=artifacts/download --kind=public --package-version=${{ needs.version.outputs.package_version }}
+
+  verify-install:
+    name: Clean registry install (${{ matrix.target }})
+    needs: [version, publish-public]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            architecture: x64
+            target: linux-x64
+          - os: windows-2022
+            architecture: x64
+            target: win32-x64
+          - os: macos-15
+            architecture: arm64
+            target: darwin-arm64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          architecture: ${{ matrix.architecture }}
           cache: npm
-          registry-url: https://registry.npmjs.org
-      - run: npm install -g npm@latest
+          registry-url: ${{ env.NPM_REGISTRY }}
+      - run: npm install --global npm@${{ env.NPM_VERSION }}
       - run: npm ci
-      - run: npm run build
-      - run: node ./tools/prepare-public-package.mjs --package-version=${{ needs.version.outputs.package_version }}
-      - name: Publish public package
-        working-directory: artifacts/publish/public/package
-        run: npm publish --provenance --access public
-      - uses: actions/upload-artifact@v7
+      - name: Verify clean install from npm
+        env:
+          EXPECTED_TARGET: ${{ matrix.target }}
+        run: npm run release:verify-install -- --package-version=${{ needs.version.outputs.package_version }}
+
+  github-release:
+    name: Create GitHub Release
+    needs: [version, verify-install]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
-          name: npm-electron-overlay-public-package
-          path: artifacts/publish/public/package/**
-          if-no-files-found: error
+          node-version: ${{ env.NODE_VERSION }}
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          pattern: npm-*-${{ needs.version.outputs.package_version }}
+          path: artifacts/download
+          merge-multiple: true
+      - name: Create checksums and release manifest
+        env:
+          EXPECTED_REPOSITORY: ${{ github.server_url }}/${{ github.repository }}
+          EXPECTED_TAG: ${{ github.ref_name }}
+          EXPECTED_COMMIT: ${{ github.sha }}
+        run: node ./tools/prepare-release-assets.mjs --artifact-dir=artifacts/download --output-dir=artifacts/github-release --package-version=${{ needs.version.outputs.package_version }}
+      - id: release-state
+        name: Revalidate remote tag and release state
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          EXPECTED_TAG: ${{ github.ref_name }}
+          EXPECTED_COMMIT: ${{ github.sha }}
+        run: node ./tools/validate-github-release-state.mjs
+      - name: Create release
+        if: steps.release-state.outputs.release_exists == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "${GITHUB_REF_NAME}" --verify-tag --title "${GITHUB_REF_NAME}" --generate-notes
+      - name: Upload release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "${GITHUB_REF_NAME}" artifacts/github-release/* --clobber
