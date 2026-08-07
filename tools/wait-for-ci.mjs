@@ -12,7 +12,9 @@ assert.match(commit, /^[a-f0-9]{40}$/);
 for (let attempt = 1; attempt <= attempts; attempt += 1) {
   const url = `${apiUrl}/repos/${repository}/actions/workflows/${encodeURIComponent(workflow)}/runs?head_sha=${commit}&event=push&per_page=100`;
   const response = await fetch(url, { headers: githubHeaders(token) });
-  assert.ok(response.ok, `GitHub Actions API failed with ${response.status}: ${await response.text()}`);
+  if (!response.ok) {
+    throw new Error(`GitHub Actions API failed with ${response.status}: ${await response.text()}`);
+  }
   const document = await response.json();
   const runs = document.workflow_runs?.filter((run) => String(run.head_sha).toLowerCase() === commit) ?? [];
   if (runs.some((run) => run.status === "completed" && run.conclusion === "success")) {
