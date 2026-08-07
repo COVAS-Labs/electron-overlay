@@ -20,13 +20,5 @@
   },
   "peerDependencies": {
     "electron": ">=37"
-  },
-  "optionalDependencies": {
-    "@covas-labs/electron-overlay-prebuilt-darwin-arm64": "0.1.0",
-    "@covas-labs/electron-overlay-prebuilt-darwin-x64": "0.1.0",
-    "@covas-labs/electron-overlay-prebuilt-linux-arm64": "0.1.0",
-    "@covas-labs/electron-overlay-prebuilt-linux-x64": "0.1.0",
-    "@covas-labs/electron-overlay-prebuilt-win32-arm64": "0.1.0",
-    "@covas-labs/electron-overlay-prebuilt-win32-x64": "0.1.0"
   }
 }
