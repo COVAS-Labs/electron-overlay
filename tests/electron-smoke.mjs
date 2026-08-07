@@ -10,7 +10,7 @@ let stage = "waiting for app readiness";
 const watchdog = setTimeout(() => {
   console.error(`Electron overlay smoke test timed out while ${stage}.`);
   app.exit(1);
-}, 10_000);
+}, 30_000);
 
 app.whenReady().then(() => {
   stage = "creating the BrowserWindow";

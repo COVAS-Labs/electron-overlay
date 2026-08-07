@@ -224,6 +224,7 @@ Napi::Object ParentObject(Napi::Env env, const ParentInfo& parent) {
 }
 
 void SetOwner(HWND window, HWND owner, Napi::Env env) {
+  if (GetWindow(window, GW_OWNER) == owner) return;
   SetLastError(ERROR_SUCCESS);
   const LONG_PTR previous =
       SetWindowLongPtrW(window, GWLP_HWNDPARENT, reinterpret_cast<LONG_PTR>(owner));
