@@ -12,6 +12,12 @@ export function prebuiltPackageName(ownerScope, target) {
   return `@${ownerScope}/electron-overlay-prebuilt-${releaseTargetId(target)}`;
 }
 
+export function prebuiltBinaryFiles({ platform }) {
+  return platform === "linux"
+    ? ["x11_overlay.node", "wayland_layer_shell.node"]
+    : ["x11_overlay.node"];
+}
+
 export function getReleaseTarget(platform = process.platform, arch = process.arch) {
   const target = RELEASE_TARGETS.find((candidate) =>
     candidate.platform === platform && candidate.arch === arch);

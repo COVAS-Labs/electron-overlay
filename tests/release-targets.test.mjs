@@ -5,6 +5,7 @@ import { PREBUILT_PACKAGES } from "../packages/electron-overlay/dist/index.js";
 
 import {
   getReleaseTarget,
+  prebuiltBinaryFiles,
   prebuiltPackageName,
   RELEASE_TARGETS,
   releaseTargetId
@@ -32,6 +33,11 @@ test("release targets are the supported prebuilt matrix", () => {
     packageName: prebuiltPackageName("covas-labs", target)
   })).sort((left, right) => left.target.localeCompare(right.target));
   assert.deepEqual(runtimePrebuilts, canonicalPrebuilts);
+  assert.deepEqual(prebuiltBinaryFiles(RELEASE_TARGETS[0]), [
+    "x11_overlay.node",
+    "wayland_layer_shell.node"
+  ]);
+  assert.deepEqual(prebuiltBinaryFiles(RELEASE_TARGETS[1]), ["x11_overlay.node"]);
 });
 
 test("unsupported release targets are rejected", () => {

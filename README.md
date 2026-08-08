@@ -2,11 +2,11 @@
 
 Window policy for Electron overlays on Linux, Windows, and macOS. The public package is `@covas-labs/electron-overlay`; the native addon remains a separate workspace package, following the same layout as `electron-vr`.
 
-Electron creates the transparent Chromium surface. Win32, macOS, and X11 use the native addon for window policy. Native Wayland uses a separate compatibility backend that applies the supported policy through Electron without assuming access to global windows, coordinates, or X11 handles.
+Electron creates the transparent Chromium surface for the existing platform backends. Native Wayland also has an experimental, separately owned layer-shell surface that does not attempt to change Chromium's existing `xdg_toplevel` role.
 
 ## Supported release platforms
 
-Prebuilt Electron addons are published for Linux x64, Windows x64, and macOS arm64. Other operating-system and architecture combinations are not currently released and fail with an explicit unsupported-prebuilt error. Linux x64 supports X11/XWayland and the Electron compatibility backend for native Wayland.
+Prebuilt Electron addons are published for Linux x64, Windows x64, and macOS arm64. Other operating-system and architecture combinations are not currently released and fail with an explicit unsupported-prebuilt error. Linux x64 supports X11/XWayland, the Electron compatibility backend, and the experimental native layer-shell module.
 
 ## Development
 
@@ -23,7 +23,7 @@ For Electron's Node ABI:
 npm run rebuild:electron
 ```
 
-Linux build dependencies are the X11 and XFixes development packages, for example `libx11-dev libxfixes-dev` on Debian/Ubuntu. Windows uses the Win32 SDK, and macOS links AppKit and ApplicationServices.
+Linux build dependencies are the Wayland, X11, and XFixes development packages, for example `libwayland-dev libx11-dev libxfixes-dev` on Debian/Ubuntu. Windows uses the Win32 SDK, and macOS links AppKit and ApplicationServices.
 
 ## Linux backends
 
@@ -37,6 +37,8 @@ This also works through XWayland and provides external window discovery, transie
 
 When Electron runs as a native Wayland client, pass the `BrowserWindow` itself to `configure()`. The `wayland-electron` backend uses Electron for click-through and best-effort always-on-top behavior. It cannot discover or parent arbitrary external windows, use global positioning, or guarantee placement above fullscreen content. These limitations are exposed through `overlay.getCapabilities()`.
 
-A future layer-shell backend will own a separate native Wayland surface. It is intentionally not implemented by trying to change the role of Chromium's existing `xdg_toplevel`.
+The experimental `wayland-layer-shell` backend owns a separate overlay-layer surface, uses an empty input region and keyboard interactivity `none`, and fills a selected `wl_output`. Its current renderer is a two-frame `wl_shm` test pattern used to validate surface lifecycle and stacking policy. Electron OSR frame transfer is the next milestone, so this backend is not yet a production renderer.
+
+KWin parent awareness remains separate from surface ownership. The planned integration will dynamically load a session script from `$XDG_RUNTIME_DIR`, use it only for game discovery and output/workspace/visibility policy, and remove it when the overlay closes.
 
 See [`packages/electron-overlay/README.md`](packages/electron-overlay/README.md) for API usage.

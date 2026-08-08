@@ -3,9 +3,11 @@ import test from "node:test";
 
 import {
   configure,
+  createLayerShellOverlay,
   displayToOverlayRect,
   findWindow,
-  getCapabilities
+  getCapabilities,
+  getLayerShellCapabilities
 } from "../packages/electron-overlay/dist/index.js";
 
 function createFakeWindow() {
@@ -43,6 +45,28 @@ test("reports explicit Wayland compatibility capabilities", () => {
     nativeOrigin: { x: 3840, y: 0 },
     scaleFactor: 2
   }, window, "wayland-electron"), { x: 1920, y: 0, width: 1280, height: 720 });
+});
+
+test("reports separate layer-shell capabilities", () => {
+  assert.deepEqual(getLayerShellCapabilities(), {
+    backend: "wayland-layer-shell",
+    clickThrough: true,
+    aboveFullscreen: true,
+    externalParent: false,
+    parentDiscovery: false,
+    globalPositioning: false,
+    outputPlacement: true,
+    parentPlacement: false,
+    keyboardInteractivity: "none",
+    renderingMode: "test-pattern"
+  });
+  assert.equal(typeof createLayerShellOverlay, "function");
+});
+
+test("validates layer-shell initialization timeouts before loading native code", async () => {
+  const placement = { type: "output", output: "DP-1", anchor: "fill" };
+  await assert.rejects(createLayerShellOverlay({ placement, initializationTimeoutMs: 99 }), /between 100 and 60000/);
+  await assert.rejects(createLayerShellOverlay({ placement, initializationTimeoutMs: 60_001 }), /between 100 and 60000/);
 });
 
 test("applies supported policy through the Electron BrowserWindow", () => {

@@ -13,6 +13,8 @@
     "test:electron:no-sandbox": "electron --no-sandbox ./tests/electron-smoke.mjs",
     "test:electron:wayland": "electron --no-sandbox --ozone-platform=wayland ./tests/electron-wayland-smoke.mjs",
     "test:electron:wayland:weston": "bash ./tools/run-weston-smoke.sh",
+    "test:electron:layer-shell": "electron ./tests/layer-shell-smoke.mjs",
+    "test:electron:layer-shell:sway": "bash ./tools/run-sway-layer-shell-smoke.sh",
     "package:prepare": "node ./tools/prepare-package-artifacts.mjs",
     "package:validate": "node ./tools/validate-package-artifacts.mjs",
     "release:pack": "node ./tools/pack-release-artifact.mjs",

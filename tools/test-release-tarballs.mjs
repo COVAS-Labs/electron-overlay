@@ -42,9 +42,16 @@ try {
 import assert from "node:assert/strict";
 const overlay = await import(${JSON.stringify(publicRecord.package)});
 assert.equal(typeof overlay.configure, "function");
+assert.equal(typeof overlay.createLayerShellOverlay, "function");
 assert.deepEqual(overlay.displayToNativeRect({ bounds: { x: 1, y: 2, width: 3, height: 4 }, scaleFactor: 1 }), { x: 1, y: 2, width: 3, height: 4 });
 try { overlay.findWindow({ title: "__electron_overlay_release_validation__", match: "exact" }); } catch (error) {
   if (process.platform !== "linux" || !String(error).includes("Could not open the X11 display")) throw error;
+}
+if (process.platform === "linux") {
+  const { createRequire } = await import("node:module");
+  const consumerRequire = createRequire(import.meta.url);
+  const layerShell = consumerRequire(${JSON.stringify(`${prebuiltRecord.package}/wayland_layer_shell.node`)});
+  assert.equal(typeof layerShell.createLayerShellOverlay, "function");
 }
 console.log("Loaded exact release tarballs for ${targetId}.");
 `.trimStart(), "utf8");

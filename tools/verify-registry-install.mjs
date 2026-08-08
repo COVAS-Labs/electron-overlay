@@ -35,10 +35,17 @@ try {
 import assert from "node:assert/strict";
 const overlay = await import(${JSON.stringify(packageName)});
 assert.equal(typeof overlay.configure, "function");
+assert.equal(typeof overlay.createLayerShellOverlay, "function");
 try {
   assert.equal(overlay.findWindow({ title: "__electron_overlay_registry_validation__", match: "exact" }), null);
 } catch (error) {
   if (process.platform !== "linux" || !String(error).includes("Could not open the X11 display")) throw error;
+}
+if (process.platform === "linux") {
+  const { createRequire } = await import("node:module");
+  const consumerRequire = createRequire(import.meta.url);
+  const layerShell = consumerRequire(${JSON.stringify(`${prebuiltName}/wayland_layer_shell.node`)});
+  assert.equal(typeof layerShell.createLayerShellOverlay, "function");
 }
 console.log("Loaded the installed native addon through findWindow for ${targetId}.");
 `.trimStart(), "utf8");

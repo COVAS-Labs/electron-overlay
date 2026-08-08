@@ -1,10 +1,10 @@
 # @covas-labs/electron-overlay
 
-A policy controller for transparent Electron overlay windows on Linux, Windows, and macOS. Linux X11/XWayland uses the native addon; native Wayland uses an Electron compatibility backend with an explicit, smaller capability set.
+A policy controller for transparent Electron overlay windows on Linux, Windows, and macOS. Linux X11/XWayland uses the native addon; native Wayland supports an Electron compatibility backend and an experimental separately owned layer-shell surface.
 
 ## Supported platforms
 
-The published prebuilt packages support Linux x64, Windows x64, and macOS arm64. Other platform and architecture combinations do not currently have a released native addon. Linux x64 supports X11/XWayland and the Electron compatibility backend for native Wayland.
+The published prebuilt packages support Linux x64, Windows x64, and macOS arm64. Other platform and architecture combinations do not currently have a released native addon. The Linux package contains separate X11 and layer-shell modules so Wayland libraries are loaded only when the experimental backend is requested.
 
 ## Usage
 
@@ -62,6 +62,8 @@ const overlay = configure(window.getNativeWindowHandle(), {
 
 Buffer targets always select the platform addon in `auto` mode for backward compatibility. If the application passes a `BrowserWindow` and forces X11 with `app.commandLine.appendSwitch('ozone-platform', 'x11')`, use `backend: 'x11'` because appended Electron switches are not visible through Node's `process.argv`.
 
+`getBackendSelection(window, backend)` reports the selected backend, whether the result is certain or inferred, and the command-line or environment evidence used. Session environment detection remains an inference; applications that explicitly choose Electron's Ozone platform should pass the matching backend.
+
 For one-time parent sizing on a backend that reports `externalParent`, configure with `position: 'parent'`. If the target is not running yet, attach it later without moving the overlay:
 
 ```js
@@ -102,6 +104,36 @@ interface OverlayCapabilities {
 `getCapabilities(window, backend)` can inspect a backend before creating an overlay. `displayToOverlayRect(display, window, backend)` returns bounds in the same backend and coordinate space that `configure(window, { backend })` will use. Wayland Electron bounds use Electron screen coordinates; their global `x` and `y` are advisory because the compositor controls top-level placement.
 
 The compatibility backend reports `aboveFullscreen: false`, `externalParent: false`, `parentDiscovery: false`, and `globalPositioning: false`. It does not emulate X11's `WM_TRANSIENT_FOR`, restacking, or EWMH policy.
+
+## Experimental layer-shell surface
+
+`createLayerShellOverlay()` owns a new native Wayland surface instead of accepting a `BrowserWindow`:
+
+```ts
+import {
+  createLayerShellOverlay,
+  getLayerShellCapabilities
+} from '@covas-labs/electron-overlay';
+
+console.log(getLayerShellCapabilities());
+
+const overlay = await createLayerShellOverlay({
+  placement: {
+    type: 'output',
+    output: 'DP-1',
+    anchor: 'fill'
+  },
+  namespace: 'my-overlay',
+  initializationTimeoutMs: 5000
+});
+
+console.log(overlay.getState());
+overlay.close();
+```
+
+The surface uses the overlay layer, exclusive zone `-1`, keyboard interactivity `none`, and an empty input region. The current implementation renders only a deterministic two-frame `wl_shm` test pattern. It validates native surface, output selection, configure, frame, buffer-release, and teardown behavior; Electron OSR content rendering is not implemented yet.
+
+The API fails explicitly on non-Linux systems, when the Linux layer-shell binary is unavailable, when the compositor does not advertise `zwlr_layer_shell_v1`, or when the required output name is absent. Initialization defaults to a five-second deadline. Use `wayland-electron` as the application-level fallback.
 
 ## Controller API
 

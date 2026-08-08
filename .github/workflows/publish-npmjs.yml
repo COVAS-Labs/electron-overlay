@@ -91,7 +91,7 @@ jobs:
         run: node --input-type=module -e "import { getReleaseTarget, releaseTargetId } from './tools/release-targets.mjs'; const actual = releaseTargetId(getReleaseTarget()); if (actual !== process.env.EXPECTED_TARGET) throw new Error('Expected ' + process.env.EXPECTED_TARGET + ', got ' + actual)"
       - name: Install Linux native dependencies
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libx11-dev libxext-dev libxfixes-dev
+        run: sudo apt-get update && sudo apt-get install -y libwayland-dev libx11-dev libxext-dev libxfixes-dev
       - run: npm ci
       - run: npm run rebuild:electron
       - run: node ./tools/prepare-prebuilt-package.mjs --package-version=${{ needs.version.outputs.package_version }}

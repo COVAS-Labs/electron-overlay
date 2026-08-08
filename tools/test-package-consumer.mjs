@@ -42,6 +42,7 @@ import assert from "node:assert/strict";
 assert.ok(process.versions.electron, "consumer must run under Electron");
 const overlay = await import(${JSON.stringify(artifacts.public.package)});
 assert.equal(typeof overlay.configure, "function");
+assert.equal(typeof overlay.createLayerShellOverlay, "function");
 assert.deepEqual(
   overlay.displayToNativeRect({ bounds: { x: 1, y: 2, width: 3, height: 4 }, scaleFactor: 1 }),
   { x: 1, y: 2, width: 3, height: 4 }
@@ -50,6 +51,12 @@ try {
   overlay.findWindow({ title: "__electron_overlay_package_validation__", match: "exact" });
 } catch (error) {
   if (process.platform !== "linux" || !String(error).includes("Could not open the X11 display")) throw error;
+}
+if (process.platform === "linux") {
+  const { createRequire } = await import("node:module");
+  const consumerRequire = createRequire(import.meta.url);
+  const layerShell = consumerRequire(${JSON.stringify(`${artifacts.prebuilt.package}/wayland_layer_shell.node`)});
+  assert.equal(typeof layerShell.createLayerShellOverlay, "function");
 }
 console.log("Loaded ${artifacts.prebuilt.package} through ${artifacts.public.package} under Electron.");
 `;

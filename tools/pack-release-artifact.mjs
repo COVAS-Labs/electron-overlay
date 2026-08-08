@@ -4,7 +4,13 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { getReleaseTarget, prebuiltPackageName, RELEASE_TARGETS, releaseTargetId } from "./release-targets.mjs";
+import {
+  getReleaseTarget,
+  prebuiltBinaryFiles,
+  prebuiltPackageName,
+  RELEASE_TARGETS,
+  releaseTargetId
+} from "./release-targets.mjs";
 import { fileDigests, npmInvocation, parseArgs, tarballName } from "./release-artifact-utils.mjs";
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -51,8 +57,8 @@ assert.equal(packed.name, manifest.name);
 assert.equal(packed.version, version);
 assert.equal(packed.filename, tarballName(manifest.name, version));
 assert.deepEqual(packed.files.map(({ path }) => path).sort(), kind === "public"
-  ? ["LICENSE", "README.md", "dist/index.d.ts", "dist/index.js", "package.json"]
-  : ["LICENSE", "README.md", "index.js", "metadata.json", "package.json", "x11_overlay.node"]);
+  ? ["LICENSE", "README.md", "THIRD_PARTY_NOTICES", "dist/index.d.ts", "dist/index.js", "package.json"]
+  : ["LICENSE", "README.md", "THIRD_PARTY_NOTICES", "index.js", "metadata.json", "package.json", ...prebuiltBinaryFiles(target)].sort());
 const tarballPath = resolve(outputDir, packed.filename);
 const digests = await fileDigests(tarballPath);
 assert.equal(digests.size, packed.size);

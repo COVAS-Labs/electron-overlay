@@ -29,6 +29,7 @@ await mkdir(packageDir, { recursive: true });
 await cp(join(sourceDir, "dist"), join(packageDir, "dist"), { recursive: true, force: true });
 await cp(join(sourceDir, "README.md"), join(packageDir, "README.md"), { force: true });
 await cp(join(repoRoot, "LICENSE"), join(packageDir, "LICENSE"), { force: true });
+await cp(join(repoRoot, "THIRD_PARTY_NOTICES"), join(packageDir, "THIRD_PARTY_NOTICES"), { force: true });
 
 const publishManifest = {
   ...sourceManifest,

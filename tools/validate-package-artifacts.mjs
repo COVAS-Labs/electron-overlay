@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 
 import {
   getReleaseTarget,
+  prebuiltBinaryFiles,
   prebuiltPackageName,
   RELEASE_TARGETS,
   releaseTargetId
@@ -24,6 +25,8 @@ const prebuiltManifest = await readJson(resolve(prebuiltDir, "package.json"));
 const metadata = await readJson(resolve(prebuiltDir, "metadata.json"));
 const ownerScope = publicManifest.name.match(/^@([^/]+)\/electron-overlay$/)?.[1];
 const rootLicense = await readFile(resolve(repoRoot, "LICENSE"), "utf8");
+const thirdPartyNotices = await readFile(resolve(repoRoot, "THIRD_PARTY_NOTICES"), "utf8");
+const binaryFiles = prebuiltBinaryFiles(target);
 
 assert.ok(ownerScope, `Unexpected public package name: ${publicManifest.name}`);
 const expectedOptionalDependencies = Object.fromEntries(
@@ -43,6 +46,7 @@ const expectedPublicManifest = {
 delete expectedPublicManifest.scripts;
 assert.deepEqual(publicManifest, expectedPublicManifest);
 assert.equal(await readFile(resolve(publicDir, "LICENSE"), "utf8"), rootLicense);
+assert.equal(await readFile(resolve(publicDir, "THIRD_PARTY_NOTICES"), "utf8"), thirdPartyNotices);
 
 const expectedPrebuiltName = prebuiltPackageName(ownerScope, target);
 assert.deepEqual(prebuiltManifest, {
@@ -57,13 +61,14 @@ assert.deepEqual(prebuiltManifest, {
   main: "index.js",
   os: [target.platform],
   cpu: [target.arch],
-  files: ["index.js", "metadata.json", "README.md", "LICENSE", "x11_overlay.node"],
+  files: ["index.js", "metadata.json", "README.md", "LICENSE", "THIRD_PARTY_NOTICES", ...binaryFiles],
   publishConfig: {
     registry: "https://registry.npmjs.org",
     access: "public"
   }
 });
 assert.equal(await readFile(resolve(prebuiltDir, "LICENSE"), "utf8"), rootLicense);
+assert.equal(await readFile(resolve(prebuiltDir, "THIRD_PARTY_NOTICES"), "utf8"), thirdPartyNotices);
 assert.deepEqual(metadata, {
   packageName: expectedPrebuiltName,
   packageVersion: sourceManifest.version,
@@ -86,6 +91,7 @@ assert.equal(prebuiltPack.version, sourceManifest.version);
 assert.deepEqual(filePaths(publicPack), [
   "LICENSE",
   "README.md",
+  "THIRD_PARTY_NOTICES",
   "dist/index.d.ts",
   "dist/index.js",
   "package.json"
@@ -93,11 +99,12 @@ assert.deepEqual(filePaths(publicPack), [
 assert.deepEqual(filePaths(prebuiltPack), [
   "LICENSE",
   "README.md",
+  "THIRD_PARTY_NOTICES",
   "index.js",
   "metadata.json",
   "package.json",
-  "x11_overlay.node"
-]);
+  ...binaryFiles
+].sort());
 
 const artifactManifest = {
   version: sourceManifest.version,

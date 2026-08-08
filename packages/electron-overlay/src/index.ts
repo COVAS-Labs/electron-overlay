@@ -64,6 +64,13 @@ export type OverlayBackendKind =
 
 export type OverlayBackendPreference = "auto" | "x11" | "wayland-electron";
 
+export interface OverlayBackendSelection {
+  backend: OverlayBackendKind;
+  source: "explicit" | "native-handle" | "ozone-argument" | "environment" | "platform-default";
+  confidence: "certain" | "inferred";
+  evidence: string;
+}
+
 export interface OverlayCapabilities {
   backend: OverlayBackendKind;
   clickThrough: boolean;
@@ -72,6 +79,44 @@ export interface OverlayCapabilities {
   parentDiscovery: boolean;
   globalPositioning: boolean;
   boundsCoordinateSpace: "native-pixels" | "electron-screen";
+}
+
+export interface LayerShellCapabilities {
+  backend: "wayland-layer-shell";
+  clickThrough: true;
+  aboveFullscreen: true;
+  externalParent: false;
+  parentDiscovery: false;
+  globalPositioning: false;
+  outputPlacement: boolean;
+  parentPlacement: boolean;
+  keyboardInteractivity: "none";
+  renderingMode: "test-pattern";
+}
+
+export interface OutputPlacement {
+  type: "output";
+  output: string;
+  anchor: "fill";
+}
+
+export interface LayerShellOverlayOptions {
+  placement: OutputPlacement;
+  namespace?: string;
+  initializationTimeoutMs?: number;
+}
+
+export interface LayerShellOverlayState {
+  configured: boolean;
+  mapped: boolean;
+  closed: boolean;
+  compositorClosed: boolean;
+  width: number;
+  height: number;
+  frameCount: number;
+  bufferReleaseCount: number;
+  output?: string;
+  error?: string;
 }
 
 export interface ElectronBrowserWindowLike {
@@ -104,12 +149,26 @@ interface NativeAddon {
   findWindow(query: WindowQuery): ParentInfo | null;
 }
 
-type SupportedBackendKind = "win32" | "macos" | "x11" | "wayland-electron";
+type SupportedBackendKind = OverlayBackendKind;
 
 interface OverlayBackend {
   readonly capabilities: OverlayCapabilities;
   configure(target: Buffer | ElectronBrowserWindowLike, options: OverlayOptions): ControllerBackend;
   findWindow(query: WindowQuery): ParentInfo | null;
+}
+
+interface NativeLayerShellController {
+  initialize(): Promise<void>;
+  getState(): LayerShellOverlayState;
+  close(): void;
+}
+
+interface NativeLayerShellAddon {
+  createLayerShellOverlay(options: {
+    output?: string;
+    namespace?: string;
+    initializationTimeoutMs?: number;
+  }): NativeLayerShellController;
 }
 
 export const PREBUILT_PACKAGES: Partial<Record<NodeJS.Platform, Partial<Record<NodeJS.Architecture, string>>>> = {
@@ -124,6 +183,7 @@ export const PREBUILT_PACKAGES: Partial<Record<NodeJS.Platform, Partial<Record<N
   }
 };
 let addon: NativeAddon | null = null;
+let layerShellAddon: NativeLayerShellAddon | null = null;
 
 const CAPABILITIES: Record<SupportedBackendKind, OverlayCapabilities> = {
   win32: {
@@ -164,42 +224,141 @@ const CAPABILITIES: Record<SupportedBackendKind, OverlayCapabilities> = {
   }
 };
 
+const LAYER_SHELL_CAPABILITIES: LayerShellCapabilities = {
+  backend: "wayland-layer-shell",
+  clickThrough: true,
+  aboveFullscreen: true,
+  externalParent: false,
+  parentDiscovery: false,
+  globalPositioning: false,
+  outputPlacement: true,
+  parentPlacement: false,
+  keyboardInteractivity: "none",
+  renderingMode: "test-pattern"
+};
+
 function nativeBackendKind(): "win32" | "macos" | "x11" {
   if (process.platform === "win32") return "win32";
   if (process.platform === "darwin") return "macos";
   return "x11";
 }
 
-function detectLinuxBackend(): "x11" | "wayland-electron" {
+function detectLinuxBackend(): OverlayBackendSelection {
   const ozoneArgument = process.argv.find((argument) => argument.startsWith("--ozone-platform="));
-  const ozonePlatform = ozoneArgument?.slice("--ozone-platform=".length)
-    ?? process.env.OZONE_PLATFORM
-    ?? process.env.ELECTRON_OZONE_PLATFORM_HINT;
-  if (ozonePlatform === "x11") return "x11";
-  if (ozonePlatform === "wayland") return "wayland-electron";
-  if (process.env.XDG_SESSION_TYPE === "wayland" && process.env.WAYLAND_DISPLAY) {
-    return "wayland-electron";
+  const ozonePlatform = ozoneArgument?.slice("--ozone-platform=".length);
+  if (ozonePlatform === "x11" || ozonePlatform === "wayland") {
+    return {
+      backend: ozonePlatform === "wayland" ? "wayland-electron" : "x11",
+      source: "ozone-argument",
+      confidence: "certain",
+      evidence: ozoneArgument!
+    };
   }
-  return "x11";
+  const ozoneEnvironment = process.env.OZONE_PLATFORM ?? process.env.ELECTRON_OZONE_PLATFORM_HINT;
+  if (ozoneEnvironment === "x11" || ozoneEnvironment === "wayland") {
+    return {
+      backend: ozoneEnvironment === "wayland" ? "wayland-electron" : "x11",
+      source: "environment",
+      confidence: "inferred",
+      evidence: `Ozone environment hint is ${ozoneEnvironment}`
+    };
+  }
+  if (process.env.XDG_SESSION_TYPE === "wayland" && process.env.WAYLAND_DISPLAY) {
+    return {
+      backend: "wayland-electron",
+      source: "environment",
+      confidence: "inferred",
+      evidence: "XDG_SESSION_TYPE=wayland and WAYLAND_DISPLAY is set"
+    };
+  }
+  return {
+    backend: "x11",
+    source: "platform-default",
+    confidence: "inferred",
+    evidence: "No explicit native-Wayland evidence was available"
+  };
+}
+
+export function getBackendSelection(
+  target?: Buffer | ElectronBrowserWindowLike,
+  preference: OverlayBackendPreference = "auto"
+): OverlayBackendSelection {
+  if (preference !== "auto") {
+    return {
+      backend: preference,
+      source: "explicit",
+      confidence: "certain",
+      evidence: `backend=${preference}`
+    };
+  }
+  if (Buffer.isBuffer(target) || process.platform !== "linux") {
+    const backend = nativeBackendKind();
+    return {
+      backend,
+      source: Buffer.isBuffer(target) ? "native-handle" : "platform-default",
+      confidence: "certain",
+      evidence: Buffer.isBuffer(target)
+        ? "Buffer targets retain the platform native backend"
+        : `process.platform=${process.platform}`
+    };
+  }
+  return detectLinuxBackend();
 }
 
 function resolveBackend(
   preference: OverlayBackendPreference,
   target?: Buffer | ElectronBrowserWindowLike
 ): SupportedBackendKind {
-  if (preference === "wayland-electron") return "wayland-electron";
-  if (preference === "x11") return "x11";
-  if (Buffer.isBuffer(target) || process.platform !== "linux") {
-    return nativeBackendKind();
-  }
-  return detectLinuxBackend();
+  return getBackendSelection(target, preference).backend;
 }
 
 export function getCapabilities(
-  target: Buffer | ElectronBrowserWindowLike,
+  target?: Buffer | ElectronBrowserWindowLike,
   backend: OverlayBackendPreference = "auto"
 ): OverlayCapabilities {
   return { ...CAPABILITIES[resolveBackend(backend, target)] };
+}
+
+export function getLayerShellCapabilities(): LayerShellCapabilities {
+  return { ...LAYER_SHELL_CAPABILITIES };
+}
+
+function loadLayerShellAddon(): NativeLayerShellAddon {
+  if (layerShellAddon) return layerShellAddon;
+  if (process.platform !== "linux") {
+    throw new Error("The wayland-layer-shell backend is only available on Linux.");
+  }
+  const require = createRequire(import.meta.url);
+  const applicationRequire = createRequire(resolve(process.cwd(), "package.json"));
+  const currentDir = dirname(fileURLToPath(import.meta.url));
+  const packageDir = resolve(currentDir, "..");
+  const nativeWorkspaceDir = resolve(packageDir, "..", "native-addon");
+  const localPath = resolve(nativeWorkspaceDir, "build", "Release", "wayland_layer_shell.node");
+  const prebuiltPackage = PREBUILT_PACKAGES.linux?.[process.arch];
+  const errors: string[] = [];
+
+  if (prebuiltPackage) {
+    for (const packageRequire of [require, applicationRequire]) {
+      try {
+        const binary = packageRequire.resolve(`${prebuiltPackage}/wayland_layer_shell.node`);
+        layerShellAddon = packageRequire(binary) as NativeLayerShellAddon;
+        break;
+      } catch (error) {
+        errors.push(String(error));
+      }
+    }
+  }
+  if (!layerShellAddon && existsSync(localPath)) {
+    try {
+      layerShellAddon = require(localPath) as NativeLayerShellAddon;
+    } catch (error) {
+      errors.push(String(error));
+    }
+  }
+  if (!layerShellAddon) {
+    throw new Error(`Failed to load the native layer-shell addon for linux-${process.arch}. ${errors.join("; ")}`);
+  }
+  return layerShellAddon;
 }
 
 function loadAddon(): NativeAddon {
@@ -312,6 +471,47 @@ export class OverlayController {
   getState(): OverlayState { return this.controller.getState(); }
   getCapabilities(): OverlayCapabilities { return { ...this.capabilities }; }
   close(): void { this.controller.close(); }
+}
+
+export class LayerShellOverlayController {
+  constructor(private readonly controller: NativeLayerShellController) {}
+
+  getState(): LayerShellOverlayState { return { ...this.controller.getState() }; }
+  getCapabilities(): LayerShellCapabilities { return getLayerShellCapabilities(); }
+  close(): void { this.controller.close(); }
+}
+
+export async function createLayerShellOverlay(
+  options: LayerShellOverlayOptions
+): Promise<LayerShellOverlayController> {
+  if (!options || !options.placement) {
+    throw new TypeError("placement is required for the layer-shell backend.");
+  }
+  const placement = options.placement;
+  if (placement.type !== "output" || placement.anchor !== "fill") {
+    throw new RangeError("The experimental layer-shell backend currently supports only fill-output placement.");
+  }
+  if (typeof placement.output !== "string" || !placement.output.trim()) {
+    throw new TypeError("placement.output must be a non-empty Wayland output name.");
+  }
+  if (options.namespace !== undefined && (typeof options.namespace !== "string" || !options.namespace.trim())) {
+    throw new TypeError("namespace must be a non-empty string.");
+  }
+  if (options.initializationTimeoutMs !== undefined
+      && (!Number.isFinite(options.initializationTimeoutMs)
+        || options.initializationTimeoutMs < 100
+        || options.initializationTimeoutMs > 60_000)) {
+    throw new RangeError("initializationTimeoutMs must be between 100 and 60000.");
+  }
+  const controller = loadLayerShellAddon().createLayerShellOverlay({
+    output: placement.output,
+    ...(options.namespace && { namespace: options.namespace }),
+    ...(options.initializationTimeoutMs !== undefined && {
+      initializationTimeoutMs: Math.round(options.initializationTimeoutMs)
+    })
+  });
+  await controller.initialize();
+  return new LayerShellOverlayController(controller);
 }
 
 export { OverlayController as X11Overlay };

@@ -2,7 +2,12 @@ import { copyFile, mkdir, rm, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { getReleaseTarget, prebuiltPackageName, releaseTargetId } from "./release-targets.mjs";
+import {
+  getReleaseTarget,
+  prebuiltBinaryFiles,
+  prebuiltPackageName,
+  releaseTargetId
+} from "./release-targets.mjs";
 
 function parseArgs(argv) {
   return Object.fromEntries(argv.filter((arg) => arg.startsWith("--")).map((arg) => {
@@ -24,12 +29,18 @@ const target = getReleaseTarget();
 const { platform, arch } = target;
 const packageName = prebuiltPackageName(ownerScope, target);
 const packageDir = resolve(repoRoot, "artifacts", "publish", `prebuilt-${releaseTargetId(target)}`, "package");
-const addonSource = resolve(repoRoot, "packages", "native-addon", "build", "Release", "x11_overlay.node");
+const binaryFiles = prebuiltBinaryFiles(target);
 
 await rm(packageDir, { recursive: true, force: true });
 await mkdir(packageDir, { recursive: true });
-await copyFile(addonSource, join(packageDir, "x11_overlay.node"));
+for (const binaryFile of binaryFiles) {
+  await copyFile(
+    resolve(repoRoot, "packages", "native-addon", "build", "Release", binaryFile),
+    join(packageDir, binaryFile)
+  );
+}
 await copyFile(resolve(repoRoot, "LICENSE"), join(packageDir, "LICENSE"));
+await copyFile(resolve(repoRoot, "THIRD_PARTY_NOTICES"), join(packageDir, "THIRD_PARTY_NOTICES"));
 await writeFile(join(packageDir, "index.js"), `module.exports = require("./x11_overlay.node");\n`, "utf8");
 await writeFile(join(packageDir, "metadata.json"), `${JSON.stringify({
   packageName,
@@ -51,7 +62,7 @@ await writeFile(join(packageDir, "package.json"), `${JSON.stringify({
   main: "index.js",
   os: [platform],
   cpu: [arch],
-  files: ["index.js", "metadata.json", "README.md", "LICENSE", "x11_overlay.node"],
+  files: ["index.js", "metadata.json", "README.md", "LICENSE", "THIRD_PARTY_NOTICES", ...binaryFiles],
   publishConfig: { registry, access }
 }, null, 2)}\n`, "utf8");
 
