@@ -23,7 +23,7 @@ try {
   await writeFile(resolve(consumerDir, "package.json"), `${JSON.stringify({ name: "electron-overlay-registry-test", private: true, type: "module" })}\n`);
   let install;
   for (let attempt = 1; attempt <= 30; attempt += 1) {
-    install = runNpm(["install", "--legacy-peer-deps", "--no-audit", "--no-fund", "--no-package-lock", `${packageName}@${version}`, `electron@${electronVersion}`], consumerDir);
+    install = runNpm(["install", "--legacy-peer-deps", "--no-audit", "--no-fund", `${packageName}@${version}`, `electron@${electronVersion}`], consumerDir);
     if (install.status === 0) break;
     if (attempt < 30) await new Promise((resolveDelay) => setTimeout(resolveDelay, 10000));
   }
@@ -50,6 +50,8 @@ console.log("Loaded the installed native addon through findWindow for ${targetId
   });
   if (electron.error) throw electron.error;
   assert.equal(electron.status, 0, `Electron import failed with status ${electron.status}`);
+  const signatureAudit = runNpm(["audit", "signatures"], consumerDir);
+  assert.equal(signatureAudit.status, 0, signatureAudit.stderr || signatureAudit.stdout);
 } finally {
   await rm(consumerDir, { recursive: true, force: true });
 }

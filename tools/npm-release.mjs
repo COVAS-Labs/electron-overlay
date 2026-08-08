@@ -1,7 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { readdir } from "node:fs/promises";
 import { resolve } from "node:path";
 
 import { prebuiltPackageName, RELEASE_TARGETS, releaseTargetId } from "./release-targets.mjs";
@@ -88,20 +87,6 @@ async function verifyRegistryPackage(record, metadata) {
       && String(dependency.digest?.gitCommit).toLowerCase() === expectedCommit);
   });
   assert.ok(statement, "No SLSA provenance statement binds this tarball to the expected repository, workflow, tag, and source gitCommit");
-  await auditProvenance(record.package, record.version);
-}
-
-async function auditProvenance(packageName, packageVersion) {
-  const directory = await mkdtemp(resolve(tmpdir(), "npm-provenance-audit-"));
-  try {
-    await writeFile(resolve(directory, "package.json"), `${JSON.stringify({ name: "npm-provenance-audit", private: true })}\n`);
-    const install = runNpm(["install", "--package-lock-only", "--ignore-scripts", "--force", "--no-audit", "--no-fund", `${packageName}@${packageVersion}`], directory);
-    assert.equal(install.status, 0, install.stderr || install.stdout);
-    const audit = runNpm(["audit", "signatures"], directory);
-    assert.equal(audit.status, 0, audit.stderr || audit.stdout);
-  } finally {
-    await rm(directory, { recursive: true, force: true });
-  }
 }
 
 async function registryMetadata(packageName, packageVersion) {
