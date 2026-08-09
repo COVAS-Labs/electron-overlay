@@ -1,0 +1,14 @@
+[
+  { "id": "coordinates", "mode": "x11", "pointer": "none" },
+  { "id": "bounds", "mode": "x11", "pointer": "reference" },
+  { "id": "policy", "mode": "x11", "pointer": "reference" },
+  { "id": "parent", "mode": "x11", "pointer": "none" },
+  { "id": "parent-fullscreen", "mode": "x11", "pointer": "none" },
+  { "id": "parent-transition", "mode": "x11", "pointer": "none" },
+  { "id": "parent-geometry", "mode": "x11", "pointer": "none" },
+  { "id": "parent-lifecycle", "mode": "x11", "pointer": "none" },
+  { "id": "parent-matching", "mode": "x11", "pointer": "none" },
+  { "id": "input-blocking", "mode": "x11", "pointer": "overlay" },
+  { "id": "wayland-compat", "mode": "wayland", "pointer": "none" },
+  { "id": "layer-shell", "mode": "layer-shell", "pointer": "none" }
+]

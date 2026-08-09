@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>electron-overlay visual demo</title>
+    <link rel="stylesheet" href="./styles.css">
+  </head>
+  <body>
+    <main id="canvas">
+      <div class="registration registration-nw" aria-hidden="true"></div>
+      <div class="registration registration-ne" aria-hidden="true"></div>
+      <div class="registration registration-sw" aria-hidden="true"></div>
+      <div class="registration registration-se" aria-hidden="true"></div>
+
+      <header class="masthead panel">
+        <div>
+          <p class="eyebrow">COVAS LABS / ELECTRON OVERLAY</p>
+          <h1 id="title"></h1>
+          <p id="subtitle" class="subtitle"></p>
+        </div>
+        <div id="verification" class="verification" data-verification="pending">
+          <span class="verification-dot"></span>
+          <span id="status">WAIT</span>
+        </div>
+      </header>
+
+      <section class="aperture" aria-label="Transparent compositor inspection area">
+        <div class="aperture-label">TRANSPARENT COMPOSITOR APERTURE</div>
+        <div class="crosshair crosshair-horizontal"></div>
+        <div class="crosshair crosshair-vertical"></div>
+      </section>
+
+      <button id="pointer-probe" class="pointer-probe" type="button" data-pointer-state="armed">
+        POINTER PROBE / ARMED
+      </button>
+
+      <section class="trace panel">
+        <p class="section-label">API TRACE</p>
+        <ol id="trace"></ol>
+      </section>
+
+      <section class="facts panel">
+        <p class="section-label">OBSERVED STATE</p>
+        <dl id="facts"></dl>
+      </section>
+
+      <footer class="footer panel">
+        <div>
+          <span class="section-label">SCREENSHOT ASSERTION</span>
+          <strong id="expectation"></strong>
+        </div>
+        <code id="scenario"></code>
+      </footer>
+    </main>
+    <script type="module" src="./renderer.js"></script>
+  </body>
+</html>

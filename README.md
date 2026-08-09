@@ -42,3 +42,24 @@ The experimental `wayland-layer-shell` backend owns a separate overlay-layer sur
 KWin parent awareness remains separate from surface ownership. The planned integration will dynamically load a session script from `$XDG_RUNTIME_DIR`, use it only for game discovery and output/workspace/visibility policy, and remove it when the overlay closes.
 
 See [`packages/electron-overlay/README.md`](packages/electron-overlay/README.md) for API usage.
+
+## Visual demos
+
+The private [`packages/demo`](packages/demo) workspace contains deterministic, screenshot-ready Electron scenes for fixed bounds, controller policy changes, cross-process parent discovery and lifecycle transitions, input routing, coordinate diagnostics, native Wayland compatibility, and native Wayland layer shell. Each scene emits a machine-readable readiness report after renderer stabilization and native request/state validation so VM automation knows when to begin compositor-frame stabilization and capture.
+
+```sh
+npm run demo -- --demo=bounds
+npm run demo -- --demo=policy
+npm run demo -- --demo=parent
+npm run demo -- --demo=parent-fullscreen
+npm run demo -- --demo=parent-transition
+npm run demo -- --demo=coordinates
+```
+
+See [`packages/demo/README.md`](packages/demo/README.md) for the layer-shell command and screenshot contract.
+
+Run all visual scenarios in a disposable Linux x64 OrbStack machine:
+
+```sh
+npm run test:visual:orbstack
+```

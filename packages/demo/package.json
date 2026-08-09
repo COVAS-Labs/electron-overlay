@@ -1,0 +1,13 @@
+{
+  "name": "@covas-labs/electron-overlay-demo",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "start": "electron ./main.mjs",
+    "start:layer-shell": "electron --no-sandbox --ozone-platform=wayland ./main.mjs --demo=layer-shell"
+  },
+  "dependencies": {
+    "@covas-labs/electron-overlay": "*"
+  }
+}
