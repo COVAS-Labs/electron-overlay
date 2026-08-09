@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <poll.h>
@@ -26,6 +27,7 @@
 #include <unistd.h>
 #include <wayland-client.h>
 
+#include "linux-dmabuf-v1-client-protocol.h"
 #include "wlr-layer-shell-unstable-v1-client-protocol.h"
 
 namespace {
@@ -35,6 +37,16 @@ constexpr uint32_t kAllAnchors =
     ZWLR_LAYER_SURFACE_V1_ANCHOR_BOTTOM |
     ZWLR_LAYER_SURFACE_V1_ANCHOR_LEFT |
     ZWLR_LAYER_SURFACE_V1_ANCHOR_RIGHT;
+
+constexpr uint32_t Fourcc(char a, char b, char c, char d) {
+  return static_cast<uint32_t>(a) | (static_cast<uint32_t>(b) << 8)
+      | (static_cast<uint32_t>(c) << 16) | (static_cast<uint32_t>(d) << 24);
+}
+
+constexpr uint32_t kDrmFormatAbgr8888 = Fourcc('A', 'B', '2', '4');
+constexpr uint32_t kDrmFormatArgb8888 = Fourcc('A', 'R', '2', '4');
+constexpr uint64_t kDrmFormatModInvalid = 0x00ffffffffffffffULL;
+constexpr uint64_t kMaxJsSafeInteger = 9007199254740991ULL;
 
 struct Output {
   uint32_t globalName = 0;
@@ -46,6 +58,31 @@ struct Output {
 };
 
 class LayerShellController;
+
+enum class FrameBackend { kShm, kDmabuf };
+
+struct DmabufCompletionQueue {
+  std::mutex mutex;
+  std::deque<uint64_t> ids;
+};
+
+struct DmabufLease {
+  ~DmabufLease() {
+    if (!queue || id == 0) return;
+    std::lock_guard<std::mutex> lock(queue->mutex);
+    queue->ids.push_back(id);
+  }
+
+  DmabufCompletionQueue* queue = nullptr;
+  uint64_t id = 0;
+};
+
+struct DmabufPlane {
+  int fd = -1;
+  uint32_t stride = 0;
+  uint32_t offset = 0;
+  uint64_t size = 0;
+};
 
 struct ShmBuffer {
   LayerShellController* owner = nullptr;
@@ -62,10 +99,33 @@ struct ShmBuffer {
 };
 
 struct PendingFrame {
+  ~PendingFrame() {
+    for (DmabufPlane& plane : planes) {
+      if (plane.fd >= 0) close(plane.fd);
+    }
+  }
+
+  FrameBackend backend = FrameBackend::kShm;
+  std::unique_ptr<DmabufLease> dmabufLease;
   std::vector<uint8_t> pixels;
+  std::vector<DmabufPlane> planes;
   uint32_t width = 0;
   uint32_t height = 0;
+  uint32_t format = 0;
+  uint64_t modifier = 0;
   uint64_t generation = 0;
+};
+
+struct DmabufImport {
+  LayerShellController* owner = nullptr;
+  zwp_linux_buffer_params_v1* params = nullptr;
+  std::unique_ptr<PendingFrame> frame;
+};
+
+struct DmabufBuffer {
+  LayerShellController* owner = nullptr;
+  wl_buffer* proxy = nullptr;
+  std::unique_ptr<PendingFrame> frame;
 };
 
 class LayerShellController : public Napi::ObjectWrap<LayerShellController> {
@@ -74,6 +134,8 @@ class LayerShellController : public Napi::ObjectWrap<LayerShellController> {
     return DefineClass(env, "LayerShellController", {
       InstanceMethod("initialize", &LayerShellController::InitializeMethod),
       InstanceMethod("submitFrame", &LayerShellController::SubmitFrame),
+      InstanceMethod("submitDmabuf", &LayerShellController::SubmitDmabuf),
+      InstanceMethod("takeReleasedDmabufs", &LayerShellController::TakeReleasedDmabufs),
       InstanceMethod("getState", &LayerShellController::GetState),
       InstanceMethod("close", &LayerShellController::CloseMethod)
     });
@@ -164,6 +226,12 @@ class LayerShellController : public Napi::ObjectWrap<LayerShellController> {
     wl_registry_add_listener(registry_, &registryListener, this);
     Roundtrip("discovering Wayland globals");
     Roundtrip("reading Wayland output names");
+
+    dmabufUsable_ = dmabuf_ && std::any_of(
+        dmabufFormats_.begin(), dmabufFormats_.end(), [](const auto& pair) {
+          return pair.first == kDrmFormatAbgr8888
+              || pair.first == kDrmFormatArgb8888;
+        });
 
     if (!compositor_) throw std::runtime_error("Wayland compositor does not expose wl_compositor.");
     if (!shm_) throw std::runtime_error("Wayland compositor does not expose wl_shm.");
@@ -411,6 +479,21 @@ class LayerShellController : public Napi::ObjectWrap<LayerShellController> {
     }
     wl_surface_commit(surface_);
     frameCount_ += 1;
+    bufferBackend_ = FrameBackend::kShm;
+    mapped_ = true;
+  }
+
+  void AttachDmabuf(DmabufBuffer* buffer) {
+    if (!buffer || !buffer->proxy || !buffer->frame || !surface_) return;
+    wl_surface_attach(surface_, buffer->proxy, 0, 0);
+    wl_surface_damage(surface_, 0, 0, static_cast<int32_t>(buffer->frame->width),
+                      static_cast<int32_t>(buffer->frame->height));
+    frameCallback_ = wl_surface_frame(surface_);
+    static const wl_callback_listener callbackListener = { FrameDone };
+    wl_callback_add_listener(frameCallback_, &callbackListener, this);
+    wl_surface_commit(surface_);
+    frameCount_ += 1;
+    bufferBackend_ = FrameBackend::kDmabuf;
     mapped_ = true;
   }
 
@@ -461,10 +544,12 @@ class LayerShellController : public Napi::ObjectWrap<LayerShellController> {
       }
       if (descriptors[1].revents & POLLIN) DrainWake();
     }
+    DestroyWaylandObjects();
   }
 
   void PumpFrame() {
-    if (stop_ || compositorClosed_ || !configured_ || frameCallback_) return;
+    if (stop_ || compositorClosed_ || !configured_ || frameCallback_
+        || dmabufImport_) return;
     std::unique_ptr<PendingFrame> frame;
     ShmBuffer* target = nullptr;
     {
@@ -477,19 +562,70 @@ class LayerShellController : public Napi::ObjectWrap<LayerShellController> {
         droppedFrameCount_ += 1;
         return;
       }
-      const auto available = std::find_if(buffers_.begin(), buffers_.end(), [this](const auto& buffer) {
-        return buffer->active && buffer->released
-            && buffer->generation == configuredGeneration_;
-      });
-      if (available == buffers_.end()) return;
-      target = available->get();
-      frame = std::move(pendingFrame_);
+      if (pendingFrame_->backend == FrameBackend::kDmabuf) {
+        if (!dmabufUsable_) {
+          pendingFrame_.reset();
+          droppedFrameCount_ += 1;
+          return;
+        }
+        frame = std::move(pendingFrame_);
+      }
+      if (!frame) {
+        const auto available = std::find_if(
+            buffers_.begin(), buffers_.end(), [this](const auto& buffer) {
+              return buffer->active && buffer->released
+                  && buffer->generation == configuredGeneration_;
+            });
+        if (available == buffers_.end()) return;
+        target = available->get();
+        frame = std::move(pendingFrame_);
+      }
+    }
+    if (frame->backend == FrameBackend::kDmabuf) {
+      StartDmabufImport(std::move(frame));
+      return;
     }
     std::memcpy(target->data, frame->pixels.data(), frame->pixels.size());
     uint32_t checksum = 2166136261u;
     for (const uint8_t byte : frame->pixels) checksum = (checksum ^ byte) * 16777619u;
     AttachFrame(target, true);
     lastFrameChecksum_ = checksum;
+  }
+
+  void StartDmabufImport(std::unique_ptr<PendingFrame> frame) {
+    auto import = std::make_unique<DmabufImport>();
+    import->owner = this;
+    import->frame = std::move(frame);
+    import->params = zwp_linux_dmabuf_v1_create_params(dmabuf_);
+    if (!import->params) {
+      RecordDmabufFailure("Could not create DMA-BUF import parameters.", true);
+      droppedFrameCount_ += 1;
+      return;
+    }
+    static const zwp_linux_buffer_params_v1_listener listener = {
+      DmabufCreated,
+      DmabufFailed
+    };
+    zwp_linux_buffer_params_v1_add_listener(import->params, &listener, import.get());
+    const uint32_t modifierHi = static_cast<uint32_t>(import->frame->modifier >> 32);
+    const uint32_t modifierLo = static_cast<uint32_t>(import->frame->modifier);
+    for (uint32_t index = 0; index < import->frame->planes.size(); index += 1) {
+      const DmabufPlane& plane = import->frame->planes[index];
+      zwp_linux_buffer_params_v1_add(import->params, plane.fd, index,
+                                     plane.offset, plane.stride,
+                                     modifierHi, modifierLo);
+    }
+    zwp_linux_buffer_params_v1_create(
+        import->params, static_cast<int32_t>(import->frame->width),
+        static_cast<int32_t>(import->frame->height), import->frame->format, 0);
+    dmabufImport_ = std::move(import);
+  }
+
+  void RecordDmabufFailure(std::string failure, bool disable) {
+    if (disable) dmabufUsable_ = false;
+    dmabufImportFailureCount_ += 1;
+    std::lock_guard<std::mutex> lock(dmabufFailureMutex_);
+    dmabufLastFailure_ = std::move(failure);
   }
 
   void SignalWake() {
@@ -554,24 +690,49 @@ class LayerShellController : public Napi::ObjectWrap<LayerShellController> {
     wakeFd_ = -1;
     mapped_ = false;
 
+    if (!dispatchThread_.joinable()) DestroyWaylandObjects();
+  }
+
+  void DestroyWaylandObjects() {
+    if (dmabufImport_) {
+      if (dmabufImport_->params) {
+        zwp_linux_buffer_params_v1_destroy(dmabufImport_->params);
+      }
+      dmabufImport_.reset();
+    }
     if (frameCallback_) wl_callback_destroy(frameCallback_);
     frameCallback_ = nullptr;
+    for (const std::unique_ptr<DmabufBuffer>& buffer : dmabufBuffers_) {
+      if (buffer->proxy) wl_buffer_destroy(buffer->proxy);
+    }
+    dmabufBuffers_.clear();
     for (const std::unique_ptr<ShmBuffer>& buffer : buffers_) {
       DestroyBuffer(*buffer);
     }
+    buffers_.clear();
     if (layerSurface_) zwlr_layer_surface_v1_destroy(layerSurface_);
     if (surface_) wl_surface_destroy(surface_);
     for (Output& output : outputs_) {
       if (output.proxy) wl_output_destroy(output.proxy);
+      output.proxy = nullptr;
     }
     if (layerShell_) {
       if (layerShellVersion_ >= 3) zwlr_layer_shell_v1_destroy(layerShell_);
       else wl_proxy_destroy(reinterpret_cast<wl_proxy*>(layerShell_));
     }
+    if (dmabuf_) zwp_linux_dmabuf_v1_destroy(dmabuf_);
     if (shm_) wl_shm_destroy(shm_);
     if (compositor_) wl_compositor_destroy(compositor_);
     if (registry_) wl_registry_destroy(registry_);
     if (display_) wl_display_disconnect(display_);
+    frameCallback_ = nullptr;
+    layerSurface_ = nullptr;
+    surface_ = nullptr;
+    layerShell_ = nullptr;
+    dmabuf_ = nullptr;
+    shm_ = nullptr;
+    compositor_ = nullptr;
+    registry_ = nullptr;
     display_ = nullptr;
   }
 
@@ -638,6 +799,228 @@ class LayerShellController : public Napi::ObjectWrap<LayerShellController> {
     return Napi::Boolean::New(env, true);
   }
 
+  Napi::Value SubmitDmabuf(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() != 2 || !info[0].IsObject() || info[0].IsArray()
+        || !info[1].IsNumber()) {
+      Napi::TypeError::New(env, "submitDmabuf expects an info object and submissionId.")
+          .ThrowAsJavaScriptException();
+      return env.Undefined();
+    }
+    const double submissionIdValue = info[1].As<Napi::Number>().DoubleValue();
+    if (!std::isfinite(submissionIdValue)
+        || std::floor(submissionIdValue) != submissionIdValue
+        || submissionIdValue <= 0
+        || submissionIdValue > static_cast<double>(kMaxJsSafeInteger)) {
+      Napi::RangeError::New(env, "submissionId must be a positive JavaScript safe integer.")
+          .ThrowAsJavaScriptException();
+      return env.Undefined();
+    }
+    const uint64_t submissionId = static_cast<uint64_t>(submissionIdValue);
+    const Napi::Object value = info[0].As<Napi::Object>();
+    if (!value.Has("codedSize") || !value.Get("codedSize").IsObject()
+        || value.Get("codedSize").IsArray() || !value.Has("pixelFormat")
+        || !value.Get("pixelFormat").IsString() || !value.Has("modifier")
+        || !value.Get("modifier").IsString() || !value.Has("planes")
+        || !value.Get("planes").IsArray()) {
+      Napi::TypeError::New(
+          env, "DMA-BUF info requires codedSize, pixelFormat, modifier, and planes.")
+          .ThrowAsJavaScriptException();
+      return env.Undefined();
+    }
+
+    const Napi::Object codedSize = value.Get("codedSize").As<Napi::Object>();
+    if (!codedSize.Has("width") || !codedSize.Get("width").IsNumber()
+        || !codedSize.Has("height") || !codedSize.Get("height").IsNumber()) {
+      Napi::TypeError::New(env, "codedSize width and height must be numbers.")
+          .ThrowAsJavaScriptException();
+      return env.Undefined();
+    }
+    const double widthValue = codedSize.Get("width").As<Napi::Number>().DoubleValue();
+    const double heightValue = codedSize.Get("height").As<Napi::Number>().DoubleValue();
+    if (!std::isfinite(widthValue) || std::floor(widthValue) != widthValue
+        || widthValue <= 0 || widthValue > INT32_MAX
+        || !std::isfinite(heightValue) || std::floor(heightValue) != heightValue
+        || heightValue <= 0 || heightValue > INT32_MAX) {
+      Napi::RangeError::New(env, "codedSize must contain positive int32 dimensions.")
+          .ThrowAsJavaScriptException();
+      return env.Undefined();
+    }
+    const uint32_t width = static_cast<uint32_t>(widthValue);
+    const uint32_t height = static_cast<uint32_t>(heightValue);
+
+    const std::string pixelFormat = value.Get("pixelFormat").As<Napi::String>().Utf8Value();
+    uint32_t format = 0;
+    if (pixelFormat == "rgba") format = kDrmFormatAbgr8888;
+    else if (pixelFormat == "bgra") format = kDrmFormatArgb8888;
+    else {
+      Napi::RangeError::New(env, "pixelFormat must be 'rgba' or 'bgra'.")
+          .ThrowAsJavaScriptException();
+      return env.Undefined();
+    }
+
+    const std::string modifierText = value.Get("modifier").As<Napi::String>().Utf8Value();
+    uint64_t modifier = 0;
+    if (modifierText.empty()) {
+      Napi::RangeError::New(env, "modifier must be an unsigned 64-bit decimal string.")
+          .ThrowAsJavaScriptException();
+      return env.Undefined();
+    }
+    for (const char digit : modifierText) {
+      if (digit < '0' || digit > '9'
+          || modifier > (std::numeric_limits<uint64_t>::max()
+                         - static_cast<uint64_t>(digit - '0')) / 10) {
+        Napi::RangeError::New(env, "modifier must be an unsigned 64-bit decimal string.")
+            .ThrowAsJavaScriptException();
+        return env.Undefined();
+      }
+      modifier = modifier * 10 + static_cast<uint64_t>(digit - '0');
+    }
+
+    const Napi::Array planesValue = value.Get("planes").As<Napi::Array>();
+    if (planesValue.Length() != 1) {
+      Napi::RangeError::New(env, "ARGB8888 and ABGR8888 DMA-BUF frames require exactly one plane.")
+          .ThrowAsJavaScriptException();
+      return env.Undefined();
+    }
+    const bool compatible = std::find(
+        dmabufFormats_.begin(), dmabufFormats_.end(),
+        std::make_pair(format, modifier)) != dmabufFormats_.end();
+    uint64_t generation = 0;
+    {
+      std::lock_guard<std::mutex> lock(frameMutex_);
+      if (!acceptingFrames_ || closed_ || compositorClosed_ || !dmabufUsable_
+          || !compatible || width != configuredWidth_ || height != configuredHeight_) {
+        if (width != configuredWidth_ || height != configuredHeight_) droppedFrameCount_ += 1;
+        return Napi::Boolean::New(env, false);
+      }
+      generation = configuredGeneration_;
+    }
+
+    auto frame = std::make_unique<PendingFrame>();
+    frame->backend = FrameBackend::kDmabuf;
+    frame->width = width;
+    frame->height = height;
+    frame->format = format;
+    frame->modifier = modifier;
+    frame->generation = generation;
+    frame->planes.reserve(1);
+
+    const Napi::Value planeValue = planesValue.Get(uint32_t{0});
+    if (!planeValue.IsObject() || planeValue.IsArray()) {
+      Napi::TypeError::New(env, "The DMA-BUF plane must be an object.")
+          .ThrowAsJavaScriptException();
+      return env.Undefined();
+    }
+    const Napi::Object planeObject = planeValue.As<Napi::Object>();
+    if (!planeObject.Has("fd") || !planeObject.Get("fd").IsNumber()) {
+      Napi::TypeError::New(env, "DMA-BUF plane fd must be a number.")
+          .ThrowAsJavaScriptException();
+      return env.Undefined();
+    }
+    const double fdValue = planeObject.Get("fd").As<Napi::Number>().DoubleValue();
+    if (!std::isfinite(fdValue) || std::floor(fdValue) != fdValue
+        || fdValue < 0 || fdValue > INT32_MAX) {
+      Napi::RangeError::New(env, "DMA-BUF plane fd is outside its valid integer range.")
+          .ThrowAsJavaScriptException();
+      return env.Undefined();
+    }
+    frame->dmabufLease = std::make_unique<DmabufLease>();
+    frame->dmabufLease->queue = &dmabufCompletionQueue_;
+    frame->dmabufLease->id = submissionId;
+    const int duplicate = fcntl(static_cast<int>(fdValue), F_DUPFD_CLOEXEC, 0);
+    if (duplicate < 0) {
+      Napi::Error::New(env, std::string("Could not duplicate DMA-BUF plane fd: ")
+                           + std::strerror(errno)).ThrowAsJavaScriptException();
+      return env.Undefined();
+    }
+    DmabufPlane plane;
+    plane.fd = duplicate;
+    frame->planes.push_back(plane);
+
+    const char* fields[] = { "stride", "offset", "size" };
+    for (const char* field : fields) {
+      if (!planeObject.Has(field) || !planeObject.Get(field).IsNumber()) {
+        Napi::TypeError::New(env, std::string("DMA-BUF plane ") + field + " must be a number.")
+            .ThrowAsJavaScriptException();
+        return env.Undefined();
+      }
+    }
+    const double strideValue = planeObject.Get("stride").As<Napi::Number>().DoubleValue();
+    const double offsetValue = planeObject.Get("offset").As<Napi::Number>().DoubleValue();
+    const double sizeValue = planeObject.Get("size").As<Napi::Number>().DoubleValue();
+    if (!std::isfinite(strideValue) || std::floor(strideValue) != strideValue
+        || strideValue <= 0 || strideValue > UINT32_MAX
+        || !std::isfinite(offsetValue) || std::floor(offsetValue) != offsetValue
+        || offsetValue < 0 || offsetValue > UINT32_MAX
+        || !std::isfinite(sizeValue) || std::floor(sizeValue) != sizeValue
+        || sizeValue <= 0 || sizeValue > static_cast<double>(kMaxJsSafeInteger)) {
+      Napi::RangeError::New(env, "DMA-BUF plane values are outside their valid integer ranges.")
+          .ThrowAsJavaScriptException();
+      return env.Undefined();
+    }
+    DmabufPlane& ownedPlane = frame->planes[0];
+    ownedPlane.stride = static_cast<uint32_t>(strideValue);
+    ownedPlane.offset = static_cast<uint32_t>(offsetValue);
+    ownedPlane.size = static_cast<uint64_t>(sizeValue);
+    struct stat descriptorStat = {};
+    if (fstat(ownedPlane.fd, &descriptorStat) < 0
+        || ownedPlane.size > static_cast<uint64_t>(INT64_MAX) - ownedPlane.offset
+        || (descriptorStat.st_size > 0
+            && ownedPlane.offset + ownedPlane.size
+                > static_cast<uint64_t>(descriptorStat.st_size))) {
+      Napi::RangeError::New(env, "DMA-BUF plane size is not plausible for its descriptor.")
+          .ThrowAsJavaScriptException();
+      return env.Undefined();
+    }
+    if (modifier == 0) {
+      const uint64_t rowBytes = static_cast<uint64_t>(width) * 4;
+      const uint64_t required = static_cast<uint64_t>(ownedPlane.stride)
+          * (height - 1) + rowBytes;
+      if (rowBytes > UINT32_MAX || ownedPlane.stride < rowBytes
+          || required < rowBytes || ownedPlane.size < required) {
+        Napi::RangeError::New(env, "Linear DMA-BUF storage does not cover codedSize.")
+            .ThrowAsJavaScriptException();
+        return env.Undefined();
+      }
+    }
+
+    {
+      std::lock_guard<std::mutex> lock(frameMutex_);
+      if (!acceptingFrames_ || closed_ || compositorClosed_ || !dmabufUsable_
+          || width != configuredWidth_ || height != configuredHeight_
+          || generation != configuredGeneration_) {
+        droppedFrameCount_ += 1;
+        return Napi::Boolean::New(env, false);
+      }
+      if (pendingFrame_) droppedFrameCount_ += 1;
+      pendingFrame_ = std::move(frame);
+      submittedFrameCount_ += 1;
+      dmabufSubmittedFrameCount_ += 1;
+      SignalWake();
+    }
+    return Napi::Boolean::New(env, true);
+  }
+
+  Napi::Value TakeReleasedDmabufs(const Napi::CallbackInfo& info) {
+    if (info.Length() != 0) {
+      Napi::TypeError::New(info.Env(), "takeReleasedDmabufs does not accept arguments.")
+          .ThrowAsJavaScriptException();
+      return info.Env().Undefined();
+    }
+    std::deque<uint64_t> released;
+    {
+      std::lock_guard<std::mutex> lock(dmabufCompletionQueue_.mutex);
+      released.swap(dmabufCompletionQueue_.ids);
+    }
+    Napi::Array result = Napi::Array::New(info.Env(), released.size());
+    uint32_t index = 0;
+    for (const uint64_t id : released) {
+      result.Set(index++, Napi::Number::New(info.Env(), static_cast<double>(id)));
+    }
+    return result;
+  }
+
   Napi::Value GetState(const Napi::CallbackInfo& info) {
     if (initializing_) {
       Napi::Error::New(info.Env(), "Cannot read layer-shell state while it is initializing.")
@@ -656,6 +1039,19 @@ class LayerShellController : public Napi::ObjectWrap<LayerShellController> {
     state.Set("submittedFrameCount", submittedFrameCount_.load());
     state.Set("droppedFrameCount", droppedFrameCount_.load());
     state.Set("lastFrameChecksum", lastFrameChecksum_.load());
+    state.Set("bufferBackend", bufferBackend_ == FrameBackend::kDmabuf
+        ? "linux-dmabuf" : "wl_shm");
+    state.Set("dmabufAdvertised", dmabufAdvertised_.load());
+    state.Set("dmabufUsable", dmabufUsable_.load());
+    state.Set("dmabufServerVersion", dmabufServerVersion_.load());
+    state.Set("dmabufBoundVersion", dmabufBoundVersion_.load());
+    state.Set("dmabufSubmittedFrameCount", dmabufSubmittedFrameCount_.load());
+    state.Set("dmabufImportFailureCount", dmabufImportFailureCount_.load());
+    {
+      std::lock_guard<std::mutex> lock(dmabufFailureMutex_);
+      if (dmabufLastFailure_.empty()) state.Set("dmabufLastFailure", info.Env().Undefined());
+      else state.Set("dmabufLastFailure", dmabufLastFailure_);
+    }
     if (selectedOutput_.empty()) state.Set("output", info.Env().Undefined());
     else state.Set("output", selectedOutput_);
     const std::string error = GetError();
@@ -692,6 +1088,109 @@ class LayerShellController : public Napi::ObjectWrap<LayerShellController> {
     *static_cast<bool*>(data) = true;
   }
 
+  static void DmabufFormat(void* data, zwp_linux_dmabuf_v1*, uint32_t format) {
+    auto* self = static_cast<LayerShellController*>(data);
+    if (self->dmabufBoundVersion_ >= 3) return;
+    const auto pair = std::make_pair(format, kDrmFormatModInvalid);
+    if (std::find(self->dmabufFormats_.begin(), self->dmabufFormats_.end(), pair)
+        == self->dmabufFormats_.end()) {
+      self->dmabufFormats_.push_back(pair);
+    }
+  }
+
+  static void DmabufModifier(void* data, zwp_linux_dmabuf_v1*, uint32_t format,
+                             uint32_t modifierHi, uint32_t modifierLo) {
+    auto* self = static_cast<LayerShellController*>(data);
+    const uint64_t modifier = (static_cast<uint64_t>(modifierHi) << 32) | modifierLo;
+    const auto pair = std::make_pair(format, modifier);
+    if (std::find(self->dmabufFormats_.begin(), self->dmabufFormats_.end(), pair)
+        == self->dmabufFormats_.end()) {
+      self->dmabufFormats_.push_back(pair);
+    }
+  }
+
+  static void DmabufCreated(void* data, zwp_linux_buffer_params_v1* params,
+                            wl_buffer* buffer) {
+    auto* importData = static_cast<DmabufImport*>(data);
+    LayerShellController* self = importData->owner;
+    if (!self->dmabufImport_ || self->dmabufImport_.get() != importData) {
+      wl_buffer_destroy(buffer);
+      return;
+    }
+    std::unique_ptr<DmabufImport> import = std::move(self->dmabufImport_);
+    zwp_linux_buffer_params_v1_destroy(params);
+    import->params = nullptr;
+    bool current = false;
+    {
+      std::lock_guard<std::mutex> lock(self->frameMutex_);
+      current = self->acceptingFrames_ && !self->stop_ && !self->compositorClosed_
+          && import->frame->generation == self->configuredGeneration_
+          && import->frame->width == self->configuredWidth_
+          && import->frame->height == self->configuredHeight_;
+    }
+    if (!current) {
+      wl_buffer_destroy(buffer);
+      self->droppedFrameCount_ += 1;
+      self->PumpFrame();
+      return;
+    }
+    auto transient = std::make_unique<DmabufBuffer>();
+    transient->owner = self;
+    transient->proxy = buffer;
+    transient->frame = std::move(import->frame);
+    static const wl_buffer_listener listener = { DmabufBufferRelease };
+    wl_buffer_add_listener(buffer, &listener, transient.get());
+    DmabufBuffer* attached = transient.get();
+    self->dmabufBuffers_.push_back(std::move(transient));
+    self->AttachDmabuf(attached);
+  }
+
+  static void DmabufFailed(void* data, zwp_linux_buffer_params_v1* params) {
+    auto* importData = static_cast<DmabufImport*>(data);
+    LayerShellController* self = importData->owner;
+    if (!self->dmabufImport_ || self->dmabufImport_.get() != importData) return;
+    std::unique_ptr<DmabufImport> import = std::move(self->dmabufImport_);
+    zwp_linux_buffer_params_v1_destroy(params);
+    import->params = nullptr;
+    bool current = false;
+    {
+      std::lock_guard<std::mutex> lock(self->frameMutex_);
+      current = self->acceptingFrames_ && !self->stop_ && !self->compositorClosed_
+          && import->frame->generation == self->configuredGeneration_
+          && import->frame->width == self->configuredWidth_
+          && import->frame->height == self->configuredHeight_;
+    }
+    self->RecordDmabufFailure(
+        "The compositor failed to import a DMA-BUF frame.", current);
+    self->droppedFrameCount_ += 1;
+    if (current) {
+      std::lock_guard<std::mutex> lock(self->frameMutex_);
+      if (self->pendingFrame_
+          && self->pendingFrame_->backend == FrameBackend::kDmabuf) {
+        self->pendingFrame_.reset();
+        self->droppedFrameCount_ += 1;
+      }
+    }
+    self->PumpFrame();
+  }
+
+  static void DmabufBufferRelease(void* data, wl_buffer*) {
+    auto* buffer = static_cast<DmabufBuffer*>(data);
+    LayerShellController* self = buffer->owner;
+    const auto match = std::find_if(
+        self->dmabufBuffers_.begin(), self->dmabufBuffers_.end(),
+        [buffer](const std::unique_ptr<DmabufBuffer>& candidate) {
+          return candidate.get() == buffer;
+        });
+    if (match != self->dmabufBuffers_.end()) {
+      wl_buffer_destroy((*match)->proxy);
+      (*match)->proxy = nullptr;
+      self->dmabufBuffers_.erase(match);
+    }
+    self->bufferReleaseCount_ += 1;
+    self->PumpFrame();
+  }
+
   static void RegistryGlobal(void* data, wl_registry* registry, uint32_t name,
                              const char* interface, uint32_t version) {
     auto* self = static_cast<LayerShellController*>(data);
@@ -701,6 +1200,18 @@ class LayerShellController : public Napi::ObjectWrap<LayerShellController> {
     } else if (std::strcmp(interface, wl_shm_interface.name) == 0) {
       self->shm_ = static_cast<wl_shm*>(wl_registry_bind(
           registry, name, &wl_shm_interface, 1));
+    } else if (std::strcmp(interface, zwp_linux_dmabuf_v1_interface.name) == 0) {
+      self->dmabufAdvertised_ = true;
+      self->dmabufServerVersion_ = version;
+      self->dmabufBoundVersion_ = std::min(version, 3u);
+      self->dmabuf_ = static_cast<zwp_linux_dmabuf_v1*>(wl_registry_bind(
+          registry, name, &zwp_linux_dmabuf_v1_interface,
+          self->dmabufBoundVersion_));
+      static const zwp_linux_dmabuf_v1_listener dmabufListener = {
+        DmabufFormat,
+        DmabufModifier
+      };
+      zwp_linux_dmabuf_v1_add_listener(self->dmabuf_, &dmabufListener, self);
     } else if (std::strcmp(interface, zwlr_layer_shell_v1_interface.name) == 0) {
       self->layerShellVersion_ = std::min(version, 4u);
       self->layerShell_ = static_cast<zwlr_layer_shell_v1*>(wl_registry_bind(
@@ -800,6 +1311,7 @@ class LayerShellController : public Napi::ObjectWrap<LayerShellController> {
   wl_registry* registry_ = nullptr;
   wl_compositor* compositor_ = nullptr;
   wl_shm* shm_ = nullptr;
+  zwp_linux_dmabuf_v1* dmabuf_ = nullptr;
   zwlr_layer_shell_v1* layerShell_ = nullptr;
   uint32_t layerShellVersion_ = 0;
   wl_surface* surface_ = nullptr;
@@ -808,7 +1320,11 @@ class LayerShellController : public Napi::ObjectWrap<LayerShellController> {
   int wakeFd_ = -1;
   std::deque<Output> outputs_;
   Output* selectedOutputInfo_ = nullptr;
+  DmabufCompletionQueue dmabufCompletionQueue_;
   std::vector<std::unique_ptr<ShmBuffer>> buffers_;
+  std::vector<std::unique_ptr<DmabufBuffer>> dmabufBuffers_;
+  std::unique_ptr<DmabufImport> dmabufImport_;
+  std::vector<std::pair<uint32_t, uint64_t>> dmabufFormats_;
   uint64_t nextGeneration_ = 1;
   std::thread dispatchThread_;
   std::string requestedOutput_;
@@ -818,6 +1334,8 @@ class LayerShellController : public Napi::ObjectWrap<LayerShellController> {
   std::chrono::steady_clock::time_point initializationDeadline_;
   std::mutex errorMutex_;
   std::string error_;
+  std::mutex dmabufFailureMutex_;
+  std::string dmabufLastFailure_;
   std::mutex frameMutex_;
   std::unique_ptr<PendingFrame> pendingFrame_;
   uint64_t configuredGeneration_ = 0;
@@ -831,13 +1349,20 @@ class LayerShellController : public Napi::ObjectWrap<LayerShellController> {
   std::atomic<bool> mapped_{false};
   std::atomic<bool> closed_{false};
   std::atomic<bool> compositorClosed_{false};
+  std::atomic<bool> dmabufAdvertised_{false};
+  std::atomic<bool> dmabufUsable_{false};
+  std::atomic<uint32_t> dmabufServerVersion_{0};
+  std::atomic<uint32_t> dmabufBoundVersion_{0};
   std::atomic<uint32_t> width_{0};
   std::atomic<uint32_t> height_{0};
   std::atomic<uint32_t> frameCount_{0};
   std::atomic<uint32_t> bufferReleaseCount_{0};
   std::atomic<uint32_t> submittedFrameCount_{0};
   std::atomic<uint32_t> droppedFrameCount_{0};
+  std::atomic<uint32_t> dmabufSubmittedFrameCount_{0};
+  std::atomic<uint32_t> dmabufImportFailureCount_{0};
   std::atomic<uint32_t> lastFrameChecksum_{0};
+  std::atomic<FrameBackend> bufferBackend_{FrameBackend::kShm};
 };
 
 Napi::Value CreateLayerShellOverlay(const Napi::CallbackInfo& info) {

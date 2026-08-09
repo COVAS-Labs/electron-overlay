@@ -92,6 +92,9 @@ export interface LayerShellCapabilities {
   parentPlacement: boolean;
   keyboardInteractivity: "none";
   renderingMode: "electron-offscreen";
+  preferredBufferTransport: "linux-dmabuf";
+  bufferTransports: readonly ["linux-dmabuf", "wl_shm"];
+  shmFallback: true;
 }
 
 export interface OutputPlacement {
@@ -118,10 +121,55 @@ export interface LayerShellOverlayState {
   submittedFrameCount: number;
   droppedFrameCount: number;
   lastFrameChecksum: number;
+  bufferBackend: "wl_shm" | "linux-dmabuf";
+  dmabufAdvertised: boolean;
+  dmabufUsable: boolean;
+  dmabufServerVersion: number;
+  dmabufBoundVersion: number;
+  dmabufSubmittedFrameCount: number;
+  dmabufImportFailureCount: number;
+  dmabufLastFailure?: string;
   sourceAttached?: boolean;
   renderError?: string;
   output?: string;
   error?: string;
+}
+
+export interface LinuxTexturePlane {
+  fd: number;
+  stride: number;
+  offset: number;
+  size: number;
+}
+
+export interface LinuxTextureInfo {
+  codedSize: { width: number; height: number };
+  pixelFormat: "rgba" | "bgra";
+  modifier: string;
+  planes: LinuxTexturePlane[];
+}
+
+export interface ElectronLinuxNativePixmapLike {
+  planes: LinuxTexturePlane[];
+  modifier: string;
+  supportsZeroCopyWebGpuImport?: boolean;
+}
+
+export interface ElectronSharedTextureInfoLike {
+  codedSize?: { width: number; height: number };
+  pixelFormat?: "rgba" | "bgra" | "rgbaf16";
+  handle?: { nativePixmap?: ElectronLinuxNativePixmapLike };
+  modifier?: string;
+  planes?: LinuxTexturePlane[];
+}
+
+export interface ElectronSharedTexturePayloadLike {
+  textureInfo: ElectronSharedTextureInfoLike;
+  release(): void;
+}
+
+export interface ElectronSharedTexturePaintEventLike {
+  texture?: ElectronSharedTexturePayloadLike;
 }
 
 export interface ElectronOffscreenNativeImageLike {
@@ -131,7 +179,7 @@ export interface ElectronOffscreenNativeImageLike {
 }
 
 export type ElectronOffscreenPaintListener = (
-  event: unknown,
+  event: ElectronSharedTexturePaintEventLike,
   dirtyRect: NativeRect,
   image: ElectronOffscreenNativeImageLike
 ) => void;
@@ -140,6 +188,7 @@ export interface ElectronOffscreenWebContentsLike {
   isOffscreen(): boolean;
   isDestroyed(): boolean;
   invalidate(): void;
+  capturePage(rect?: NativeRect): Promise<ElectronOffscreenNativeImageLike>;
   on(event: "paint", listener: ElectronOffscreenPaintListener): unknown;
   on(event: "destroyed", listener: () => void): unknown;
   removeListener(event: "paint", listener: ElectronOffscreenPaintListener): unknown;
@@ -194,6 +243,8 @@ interface OverlayBackend {
 interface NativeLayerShellController {
   initialize(): Promise<void>;
   submitFrame(frame: Buffer, width: number, height: number): boolean;
+  submitDmabuf(info: LinuxTextureInfo, submissionId: number): boolean;
+  takeReleasedDmabufs(): number[];
   getState(): LayerShellOverlayState;
   close(): void;
 }
@@ -269,7 +320,10 @@ const LAYER_SHELL_CAPABILITIES: LayerShellCapabilities = {
   outputPlacement: true,
   parentPlacement: false,
   keyboardInteractivity: "none",
-  renderingMode: "electron-offscreen"
+  renderingMode: "electron-offscreen",
+  preferredBufferTransport: "linux-dmabuf",
+  bufferTransports: ["linux-dmabuf", "wl_shm"],
+  shmFallback: true
 };
 
 function nativeBackendKind(): "win32" | "macos" | "x11" {
@@ -462,6 +516,43 @@ function validateRect(rect: NativeRect): NativeRect {
   };
 }
 
+function isNativeImageLike(value: unknown): value is ElectronOffscreenNativeImageLike {
+  if (!value || typeof value !== "object") return false;
+  const candidate = value as Partial<ElectronOffscreenNativeImageLike>;
+  return typeof candidate.isEmpty === "function"
+    && typeof candidate.getSize === "function"
+    && typeof candidate.toBitmap === "function";
+}
+
+function isSharedTexturePayload(value: unknown): value is ElectronSharedTexturePayloadLike {
+  if (!value || typeof value !== "object") return false;
+  const candidate = value as Partial<ElectronSharedTexturePayloadLike>;
+  return typeof candidate.release === "function"
+    && !!candidate.textureInfo
+    && typeof candidate.textureInfo === "object";
+}
+
+function snapshotLinuxTextureInfo(
+  texture: ElectronSharedTexturePayloadLike
+): LinuxTextureInfo | null {
+  const textureInfo = texture.textureInfo;
+  const nativePixmap = textureInfo.handle?.nativePixmap;
+  const codedSize = textureInfo.codedSize;
+  const pixelFormat = textureInfo.pixelFormat;
+  const modifier = nativePixmap?.modifier ?? textureInfo.modifier;
+  const planes = nativePixmap?.planes ?? textureInfo.planes;
+  if (!codedSize || (pixelFormat !== "rgba" && pixelFormat !== "bgra")
+      || typeof modifier !== "string" || !planes?.length) {
+    return null;
+  }
+  return {
+    codedSize: { width: codedSize.width, height: codedSize.height },
+    pixelFormat,
+    modifier,
+    planes: planes.map(({ fd, stride, offset, size }) => ({ fd, stride, offset, size }))
+  };
+}
+
 export function displayToNativeRect(display: ElectronDisplayLike): NativeRect {
   if (process.platform === "darwin") {
     return validateRect(display.bounds);
@@ -513,25 +604,108 @@ export class LayerShellOverlayController {
   private sourceAttached = false;
   private renderError?: string;
   private closed = false;
+  private sourceGeneration = 0;
+  private nextSubmissionId = 1;
+  private readonly dmabufLeases = new Map<number, ElectronSharedTexturePayloadLike>();
+  private leaseMonitor?: NodeJS.Timeout;
 
   constructor(private readonly controller: NativeLayerShellController) {}
+
+  private releaseTexture(texture: ElectronSharedTexturePayloadLike): void {
+    try {
+      texture.release();
+    } catch (error) {
+      this.renderError ??= String(error);
+    }
+  }
+
+  private allocateSubmissionId(): number {
+    const start = this.nextSubmissionId;
+    do {
+      const submissionId = this.nextSubmissionId;
+      this.nextSubmissionId = submissionId === Number.MAX_SAFE_INTEGER ? 1 : submissionId + 1;
+      if (!this.dmabufLeases.has(submissionId)) return submissionId;
+    } while (this.nextSubmissionId !== start);
+    throw new Error("No DMA-BUF submission IDs are available.");
+  }
+
+  private stopLeaseMonitor(): void {
+    if (this.leaseMonitor) clearInterval(this.leaseMonitor);
+    this.leaseMonitor = undefined;
+  }
+
+  private drainReleasedDmabufs(): void {
+    let releasedIds: number[];
+    try {
+      releasedIds = this.controller.takeReleasedDmabufs();
+    } catch (error) {
+      this.renderError ??= String(error);
+      return;
+    }
+    for (const submissionId of releasedIds) {
+      const texture = this.dmabufLeases.get(submissionId);
+      if (!texture) continue;
+      this.dmabufLeases.delete(submissionId);
+      this.releaseTexture(texture);
+    }
+    if (this.dmabufLeases.size === 0) this.stopLeaseMonitor();
+  }
+
+  private retainDmabuf(
+    submissionId: number,
+    texture: ElectronSharedTexturePayloadLike
+  ): void {
+    this.dmabufLeases.set(submissionId, texture);
+    if (this.leaseMonitor) return;
+    this.leaseMonitor = setInterval(() => this.drainReleasedDmabufs(), 25);
+    this.leaseMonitor.unref?.();
+  }
 
   attachOffscreenWindow(window: ElectronOffscreenBrowserWindowLike): void {
     if (this.closed) throw new Error("Layer-shell overlay controller is closed.");
     if (!window || typeof window !== "object" || !window.webContents) {
       throw new TypeError("attachOffscreenWindow requires an Electron offscreen BrowserWindow.");
     }
-    if (window.isDestroyed?.() || window.webContents.isDestroyed()) {
+    const webContents = window.webContents;
+    const requiredWindowMethods = ["getContentSize", "setContentSize"] as const;
+    const requiredWebContentsMethods = [
+      "isOffscreen",
+      "isDestroyed",
+      "invalidate",
+      "capturePage",
+      "on",
+      "removeListener"
+    ] as const;
+    if (requiredWindowMethods.some((method) => typeof window[method] !== "function")
+        || requiredWebContentsMethods.some((method) => typeof webContents[method] !== "function")) {
+      throw new TypeError(
+        "attachOffscreenWindow requires Electron offscreen BrowserWindow methods, including webContents.capturePage()."
+      );
+    }
+    if (window.isDestroyed?.() || webContents.isDestroyed()) {
       throw new Error("Electron offscreen BrowserWindow is destroyed.");
     }
-    if (!window.webContents.isOffscreen()) {
+    if (!webContents.isOffscreen()) {
       throw new Error("BrowserWindow must be created with webPreferences.offscreen enabled.");
     }
 
-    const webContents = window.webContents;
+    this.detachSource?.();
+    const attachmentGeneration = ++this.sourceGeneration;
     let sizeMonitor: NodeJS.Timeout | undefined;
+    let captureTimer: NodeJS.Timeout | undefined;
     let invalidatePending = false;
     let invalidating = false;
+    let sourceActive = true;
+    let captureInFlight = false;
+    let pendingCaptureGeneration: number | undefined;
+    let latestPaintGeneration = 0;
+    let lastSubmittedGeneration = 0;
+    let lastCaptureStartedAt = 0;
+    let dmabufFallbackActive = false;
+    const nextPaintGeneration = () => {
+      latestPaintGeneration += 1;
+      return latestPaintGeneration;
+    };
     const terminalError = (state: LayerShellOverlayState): string | undefined => {
       if (state.error) return state.error;
       if (state.compositorClosed) return "The Wayland compositor closed the layer-shell surface.";
@@ -558,41 +732,230 @@ export class LayerShellOverlayController {
         }
       }
     };
-    const paint: ElectronOffscreenPaintListener = (_event, _dirtyRect, image) => {
-      if (this.closed || image.isEmpty()) return;
+
+    const submitImage = (
+      image: ElectronOffscreenNativeImageLike,
+      generation: number
+    ): "submitted" | "retry" | "resize" | "terminal" => {
+      if (this.closed || !sourceActive) return "terminal";
+      if (image.isEmpty()) return "retry";
       try {
         const state = this.controller.getState();
+        const error = terminalError(state);
+        if (error) {
+          this.renderError = error;
+          this.close();
+          return "terminal";
+        }
         const size = image.getSize(1);
         if (size.width !== state.width || size.height !== state.height) {
           resizeSource(true, false);
-          return;
+          return "resize";
         }
         const bitmap = image.toBitmap({ scaleFactor: 1 });
         if (bitmap.length !== size.width * size.height * 4) {
           this.renderError = "Electron offscreen bitmap length does not match its dimensions.";
-          return;
+          return "retry";
         }
         if (!this.controller.submitFrame(bitmap, size.width, size.height)) {
           const rejectedState = this.controller.getState();
-          const error = terminalError(rejectedState);
-          if (error) {
-            this.renderError = error;
+          const rejectedError = terminalError(rejectedState);
+          if (rejectedError) {
+            this.renderError = rejectedError;
+            this.close();
+            return "terminal";
+          }
+          return "retry";
+        }
+        this.renderError = undefined;
+        lastSubmittedGeneration = Math.max(lastSubmittedGeneration, generation);
+        return "submitted";
+      } catch (error) {
+        this.renderError = String(error);
+        return this.closed ? "terminal" : "retry";
+      }
+    };
+
+    const startCaptureFallback = () => {
+      captureTimer = undefined;
+      if (!sourceActive || this.closed || captureInFlight
+          || pendingCaptureGeneration === undefined) return;
+      const captureGeneration = pendingCaptureGeneration;
+      pendingCaptureGeneration = undefined;
+      let state: LayerShellOverlayState;
+      try {
+        state = this.controller.getState();
+        const error = terminalError(state);
+        if (error) {
+          this.renderError = error;
+          this.close();
+          return;
+        }
+      } catch (error) {
+        this.renderError = String(error);
+        return;
+      }
+
+      captureInFlight = true;
+      lastCaptureStartedAt = Date.now();
+      let capture: Promise<ElectronOffscreenNativeImageLike>;
+      try {
+        capture = webContents.capturePage({ x: 0, y: 0, width: state.width, height: state.height });
+      } catch {
+        captureInFlight = false;
+        pendingCaptureGeneration = captureGeneration;
+        scheduleCaptureFallback(captureGeneration);
+        return;
+      }
+      void capture
+        .then((image) => {
+          if (!sourceActive || this.closed || attachmentGeneration !== this.sourceGeneration
+              || captureGeneration < lastSubmittedGeneration) return;
+          if (submitImage(image, captureGeneration) === "retry") {
+            pendingCaptureGeneration = Math.max(captureGeneration, latestPaintGeneration);
+          }
+        })
+        .catch(() => {
+          if (!sourceActive || this.closed) return;
+          pendingCaptureGeneration = Math.max(captureGeneration, latestPaintGeneration);
+          try {
+            const terminal = terminalError(this.controller.getState());
+            if (!terminal) return;
+            this.renderError = terminal;
+            this.close();
+          } catch (stateError) {
+            this.renderError = String(stateError);
+            this.close();
+          }
+        })
+        .finally(() => {
+          captureInFlight = false;
+          if (sourceActive && !this.closed && pendingCaptureGeneration !== undefined) {
+            scheduleCaptureFallback(pendingCaptureGeneration);
+          }
+        });
+    };
+
+    const scheduleCaptureFallback = (generation: number) => {
+      if (!sourceActive || this.closed) return;
+      pendingCaptureGeneration = generation;
+      if (captureInFlight || captureTimer) return;
+      const delay = Math.max(0, 100 - (Date.now() - lastCaptureStartedAt));
+      if (delay === 0) {
+        startCaptureFallback();
+        return;
+      }
+      captureTimer = setTimeout(startCaptureFallback, delay);
+      captureTimer.unref?.();
+    };
+
+    const useSoftwareFallback = (
+      image: ElectronOffscreenNativeImageLike | undefined,
+      generation: number
+    ) => {
+      dmabufFallbackActive = true;
+      if (!image || submitImage(image, generation) === "retry") scheduleCaptureFallback(generation);
+    };
+
+    const paint = (
+      event: ElectronSharedTexturePaintEventLike,
+      _dirtyRect: NativeRect,
+      result: unknown
+    ) => {
+      const texture = isSharedTexturePayload(event?.texture)
+        ? event.texture
+        : isSharedTexturePayload(result)
+          ? result
+          : null;
+      const image = isNativeImageLike(result) ? result : undefined;
+      let releaseTexture = texture !== null;
+      try {
+        if (this.closed || !sourceActive || attachmentGeneration !== this.sourceGeneration) return;
+        const paintGeneration = nextPaintGeneration();
+        this.drainReleasedDmabufs();
+        if (!texture) {
+          if (!image || submitImage(image, paintGeneration) === "retry") {
+            scheduleCaptureFallback(paintGeneration);
+          }
+          return;
+        }
+
+        const info = snapshotLinuxTextureInfo(texture);
+        const state = this.controller.getState();
+        const error = terminalError(state);
+        if (error) {
+          this.renderError = error;
+          this.close();
+          return;
+        }
+        if (!info || state.dmabufUsable === false) {
+          useSoftwareFallback(image, paintGeneration);
+          return;
+        }
+        if (info.codedSize.width !== state.width || info.codedSize.height !== state.height) {
+          resizeSource(true, false);
+          useSoftwareFallback(image, paintGeneration);
+          return;
+        }
+
+        const submissionId = this.allocateSubmissionId();
+        let submitted = false;
+        try {
+          submitted = this.controller.submitDmabuf(info, submissionId);
+        } catch (submitError) {
+          this.renderError = String(submitError);
+        }
+        if (!submitted) {
+          const rejectedState = this.controller.getState();
+          const rejectedError = terminalError(rejectedState);
+          if (rejectedError) {
+            this.renderError = rejectedError;
             this.close();
             return;
           }
-          resizeSource(true);
+          useSoftwareFallback(image, paintGeneration);
           return;
         }
+
+        this.retainDmabuf(submissionId, texture);
+        releaseTexture = false;
+        lastSubmittedGeneration = Math.max(lastSubmittedGeneration, paintGeneration);
+        this.drainReleasedDmabufs();
+        const submittedState = this.controller.getState();
+        const submittedError = terminalError(submittedState);
+        if (submittedError) {
+          this.renderError = submittedError;
+          this.close();
+          return;
+        }
+        if (submittedState.dmabufUsable === false) {
+          useSoftwareFallback(image, paintGeneration);
+          return;
+        }
+        dmabufFallbackActive = false;
         this.renderError = undefined;
       } catch (error) {
         this.renderError = String(error);
+        if (!this.closed && sourceActive) {
+          useSoftwareFallback(image, latestPaintGeneration || nextPaintGeneration());
+        }
+      } finally {
+        if (texture && releaseTexture) this.releaseTexture(texture);
       }
     };
-    const destroyed = () => this.close();
+    const destroyed = () => {
+      if (sourceActive && attachmentGeneration === this.sourceGeneration) this.close();
+    };
     const monitorSize = () => {
-      if (this.closed) return;
+      if (this.closed || !sourceActive || attachmentGeneration !== this.sourceGeneration) return;
       try {
+        this.drainReleasedDmabufs();
         resizeSource();
+        const state = this.controller.getState();
+        if (state.dmabufUsable === false && !dmabufFallbackActive) {
+          dmabufFallbackActive = true;
+          scheduleCaptureFallback(nextPaintGeneration());
+        }
       } catch (error) {
         this.renderError = String(error);
         this.close();
@@ -601,6 +964,10 @@ export class LayerShellOverlayController {
     webContents.on("paint", paint);
     webContents.on("destroyed", destroyed);
     const detachNewSource = () => {
+      sourceActive = false;
+      pendingCaptureGeneration = undefined;
+      if (captureTimer) clearTimeout(captureTimer);
+      captureTimer = undefined;
       if (sizeMonitor) clearInterval(sizeMonitor);
       webContents.removeListener("paint", paint);
       webContents.removeListener("destroyed", destroyed);
@@ -609,6 +976,8 @@ export class LayerShellOverlayController {
         this.sourceAttached = false;
       }
     };
+    this.detachSource = detachNewSource;
+    this.sourceAttached = true;
     try {
       resizeSource(true);
       if (this.closed) {
@@ -620,12 +989,10 @@ export class LayerShellOverlayController {
       detachNewSource();
       throw error;
     }
-    this.detachSource?.();
-    this.detachSource = detachNewSource;
-    this.sourceAttached = true;
   }
 
   getState(): LayerShellOverlayState {
+    this.drainReleasedDmabufs();
     return {
       ...this.controller.getState(),
       sourceAttached: this.sourceAttached,
@@ -636,8 +1003,21 @@ export class LayerShellOverlayController {
   close(): void {
     if (this.closed) return;
     this.closed = true;
+    this.sourceGeneration += 1;
     this.detachSource?.();
-    this.controller.close();
+    let closeError: unknown;
+    try {
+      this.controller.close();
+    } catch (error) {
+      closeError = error;
+    }
+    this.drainReleasedDmabufs();
+    this.stopLeaseMonitor();
+    for (const [submissionId, texture] of this.dmabufLeases) {
+      this.dmabufLeases.delete(submissionId);
+      this.releaseTexture(texture);
+    }
+    if (closeError) throw closeError;
   }
 }
 

@@ -88,6 +88,7 @@
             "product_extension": "node",
             "sources": [
               "native/src/layer_shell.cc",
+              "native/generated/linux-dmabuf-v1-protocol.c",
               "native/generated/wlr-layer-shell-unstable-v1-protocol.c"
             ],
             "include_dirs": [

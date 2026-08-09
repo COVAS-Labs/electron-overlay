@@ -38,6 +38,7 @@ assert.equal(typeof overlay.configure, "function");
 assert.equal(typeof overlay.createLayerShellOverlay, "function");
 assert.equal(typeof overlay.LayerShellOverlayController.prototype.attachOffscreenWindow, "function");
 assert.equal(overlay.getLayerShellCapabilities().renderingMode, "electron-offscreen");
+assert.equal(overlay.getLayerShellCapabilities().preferredBufferTransport, "linux-dmabuf");
 try {
   assert.equal(overlay.findWindow({ title: "__electron_overlay_registry_validation__", match: "exact" }), null);
 } catch (error) {
@@ -50,6 +51,8 @@ if (process.platform === "linux") {
   assert.equal(typeof layerShell.createLayerShellOverlay, "function");
   const controller = layerShell.createLayerShellOverlay({});
   assert.equal(typeof controller.submitFrame, "function");
+  assert.equal(typeof controller.submitDmabuf, "function");
+  assert.equal(typeof controller.takeReleasedDmabufs, "function");
   controller.close();
 }
 console.log("Loaded the installed native addon through findWindow for ${targetId}.");

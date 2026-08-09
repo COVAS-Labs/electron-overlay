@@ -44,6 +44,9 @@ async function main() {
   assert.equal(capabilities.aboveFullscreen, true);
   assert.equal(capabilities.outputPlacement, true);
   assert.equal(capabilities.globalPositioning, false);
+  assert.equal(capabilities.preferredBufferTransport, "linux-dmabuf");
+  assert.deepEqual(capabilities.bufferTransports, ["linux-dmabuf", "wl_shm"]);
+  assert.equal(capabilities.shmFallback, true);
 
   const requestedOutput = process.env.LAYER_SHELL_OUTPUT;
   if (!requestedOutput) throw new Error("LAYER_SHELL_OUTPUT is required.");
@@ -128,9 +131,14 @@ async function main() {
     assert.equal(state.output, requestedOutput);
     assert.equal(state.sourceAttached, true);
     assert.equal(state.renderError, undefined);
+    assert.equal(state.bufferBackend, "wl_shm");
+    assert.equal(typeof state.dmabufAdvertised, "boolean");
+    assert.equal(typeof state.dmabufUsable, "boolean");
+    assert.equal(state.dmabufSubmittedFrameCount, 0);
+    assert.equal(state.dmabufImportFailureCount, 0);
     assert.ok(state.frameCount >= 4);
     assert.ok(state.bufferReleaseCount >= 3);
-    console.log(`Rendered Electron OSR through wl_shm: ${JSON.stringify(state)}`);
+    console.log(`Rendered Electron OSR through ${state.bufferBackend}: ${JSON.stringify(state)}`);
   } finally {
     overlay.close();
     const closedState = overlay.getState();

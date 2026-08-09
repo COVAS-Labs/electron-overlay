@@ -58,7 +58,10 @@ test("reports separate layer-shell capabilities", () => {
     outputPlacement: true,
     parentPlacement: false,
     keyboardInteractivity: "none",
-    renderingMode: "electron-offscreen"
+    renderingMode: "electron-offscreen",
+    preferredBufferTransport: "linux-dmabuf",
+    bufferTransports: ["linux-dmabuf", "wl_shm"],
+    shmFallback: true
   });
   assert.equal(typeof createLayerShellOverlay, "function");
 });

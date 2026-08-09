@@ -107,7 +107,7 @@ The compatibility backend reports `aboveFullscreen: false`, `externalParent: fal
 
 ## Experimental layer-shell surface
 
-`createLayerShellOverlay()` owns a new native Wayland surface. Bind a separately created offscreen `BrowserWindow` after the compositor has configured the output size:
+`createLayerShellOverlay()` owns a new native Wayland surface. Bind a separately created offscreen `BrowserWindow` after the compositor has configured the output size. Enable shared textures to prefer direct Linux DMA-BUF import; paced `capturePage()` readback automatically feeds the `wl_shm` fallback when DMA-BUF is unavailable or rejected:
 
 ```ts
 import { BrowserWindow } from 'electron';
@@ -135,7 +135,7 @@ const window = new BrowserWindow({
   transparent: true,
   webPreferences: {
     offscreen: {
-      useSharedTexture: false,
+      useSharedTexture: true,
       deviceScaleFactor: 1
     }
   }
@@ -149,9 +149,11 @@ overlay.close();
 window.destroy();
 ```
 
-The surface uses the overlay layer, exclusive zone `-1`, keyboard interactivity `none`, and an empty input region. Electron's `paint` event supplies complete bitmap frames through `NativeImage.toBitmap({ scaleFactor: 1 })`. On little-endian Linux those premultiplied BGRA bytes map to `WL_SHM_FORMAT_ARGB8888`. The first implementation copies complete frames; dirty-rectangle updates and DMA-BUF are future optimizations.
+The surface uses the overlay layer, exclusive zone `-1`, keyboard interactivity `none`, and an empty input region. The preferred path consumes Electron shared-texture metadata from `paint`, duplicates its DMA-BUF descriptor, negotiates the exact DRM format/modifier advertised by `zwp_linux_dmabuf_v1`, and imports it as a transient `wl_buffer`. The Electron texture remains leased until that buffer is released, dropped, rejected, or closed. Only `rgba` and `bgra` single-plane textures are currently imported.
 
-`attachOffscreenWindow()` sizes the renderer to the compositor configuration, requests an initial frame, follows later size changes on paint, removes listeners on close or rebind, and closes the layer surface if the renderer is destroyed. When both native buffers are busy, only the newest uncommitted frame is retained. The controller never destroys the caller's BrowserWindow.
+The fallback path copies complete premultiplied BGRA frames into double-buffered `WL_SHM_FORMAT_ARGB8888` storage. If shared-texture rendering does not provide a bitmap, capture readback is paced and coalesced before SHM submission. `attachOffscreenWindow()` sizes the renderer to the compositor configuration, requests an initial frame, follows later size changes, removes listeners on close or rebind, and closes the layer surface if the renderer is destroyed. The native thread retains only the newest uncommitted frame for either transport. The controller never destroys the caller's BrowserWindow.
+
+`overlay.getState()` reports the most recently committed `bufferBackend`, DMA-BUF advertisement and usability, negotiated protocol versions, submitted DMA-BUF frames, import failures, and the latest nonfatal import failure. Successful SHM fallback is not reported as a terminal overlay error.
 
 The API fails explicitly on non-Linux systems, when the Linux layer-shell binary is unavailable, when the compositor does not advertise `zwlr_layer_shell_v1`, or when the required output name is absent. Initialization defaults to a five-second deadline. Use `wayland-electron` as the application-level fallback.
 

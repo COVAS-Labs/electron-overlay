@@ -21,6 +21,7 @@ unset DISPLAY WAYLAND_DISPLAY SWAYSOCK
 sway_log="$log_dir/sway.log"
 client_log="$log_dir/client.log"
 native_client_log="$log_dir/native-client.log"
+shared_texture_client_log="$log_dir/shared-texture-client.log"
 wayland_info_log="$log_dir/wayland-info.log"
 sway_pid=""
 
@@ -33,7 +34,7 @@ cleanup() {
   fi
   rm -rf "$runtime_dir"
   if (( status != 0 )); then
-    for log in "$sway_log" "$wayland_info_log" "$native_client_log" "$client_log"; do
+    for log in "$sway_log" "$wayland_info_log" "$native_client_log" "$shared_texture_client_log" "$client_log"; do
       if [[ -f "$log" ]]; then
         printf '\n===== %s =====\n' "$log" >&2
         cat "$log" >&2
@@ -78,6 +79,13 @@ native_status=${PIPESTATUS[0]}
 if (( native_status != 0 )); then
   set -e
   exit "$native_status"
+fi
+timeout --signal=TERM --kill-after=10s "${smoke_timeout}s" \
+  npm run test:electron:layer-shell:shared-texture 2>&1 | tee "$shared_texture_client_log"
+shared_texture_status=${PIPESTATUS[0]}
+if (( shared_texture_status != 0 )); then
+  set -e
+  exit "$shared_texture_status"
 fi
 timeout --signal=TERM --kill-after=10s "${smoke_timeout}s" \
   npm run test:electron:layer-shell 2>&1 | tee "$client_log"
