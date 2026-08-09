@@ -37,7 +37,7 @@ This also works through XWayland and provides external window discovery, transie
 
 When Electron runs as a native Wayland client, pass the `BrowserWindow` itself to `configure()`. The `wayland-electron` backend uses Electron for click-through and best-effort always-on-top behavior. It cannot discover or parent arbitrary external windows, use global positioning, or guarantee placement above fullscreen content. These limitations are exposed through `overlay.getCapabilities()`.
 
-The experimental `wayland-layer-shell` backend owns a separate overlay-layer surface, uses an empty input region and keyboard interactivity `none`, and fills a selected `wl_output`. Its current renderer is a two-frame `wl_shm` test pattern used to validate surface lifecycle and stacking policy. Electron OSR frame transfer is the next milestone, so this backend is not yet a production renderer.
+The experimental `wayland-layer-shell` backend owns a separate overlay-layer surface, uses an empty input region and keyboard interactivity `none`, and fills a selected `wl_output`. Electron renders HTML/CSS into an offscreen `BrowserWindow`; complete premultiplied BGRA frames are copied into double-buffered `wl_shm` storage and committed by the native Wayland thread. A single newest-frame mailbox provides bounded backpressure when the compositor is busy.
 
 KWin parent awareness remains separate from surface ownership. The planned integration will dynamically load a session script from `$XDG_RUNTIME_DIR`, use it only for game discovery and output/workspace/visibility policy, and remove it when the overlay closes.
 

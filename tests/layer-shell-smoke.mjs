@@ -1,99 +1,169 @@
 import assert from "node:assert/strict";
-import { createRequire } from "node:module";
-import { createServer } from "node:net";
-import { resolve } from "node:path";
+import { execFile } from "node:child_process";
 import { setTimeout as delay } from "node:timers/promises";
-import { fileURLToPath } from "node:url";
+import { promisify } from "node:util";
+
+import { app, BrowserWindow } from "electron";
 
 import {
   createLayerShellOverlay,
   getLayerShellCapabilities
 } from "../packages/electron-overlay/dist/index.js";
 
-if (process.platform !== "linux") {
-  throw new Error("The layer-shell smoke test is Linux-only.");
-}
+const execFileAsync = promisify(execFile);
+
+if (process.platform !== "linux") throw new Error("The layer-shell smoke test is Linux-only.");
 if (!process.env.WAYLAND_DISPLAY || process.env.DISPLAY) {
   throw new Error("The layer-shell smoke test requires native Wayland without DISPLAY.");
 }
-
-const require = createRequire(import.meta.url);
-const nativeAddon = require(fileURLToPath(new URL(
-  "../packages/native-addon/build/Release/wayland_layer_shell.node",
-  import.meta.url
-)));
-const closedController = nativeAddon.createLayerShellOverlay({});
-closedController.close();
-assert.throws(() => closedController.initialize(), /closed/);
-
-const compositorDisplay = process.env.WAYLAND_DISPLAY;
-const stalledSocket = resolve(process.env.XDG_RUNTIME_DIR, "electron-overlay-stalled-wayland");
-const stalledConnections = new Set();
-const stalledServer = createServer((socket) => {
-  stalledConnections.add(socket);
-  socket.once("close", () => stalledConnections.delete(socket));
-});
-await new Promise((resolveListen, rejectListen) => {
-  stalledServer.once("error", rejectListen);
-  stalledServer.listen(stalledSocket, resolveListen);
-});
-process.env.WAYLAND_DISPLAY = stalledSocket;
-const timeoutStarted = Date.now();
-try {
-  await assert.rejects(
-    createLayerShellOverlay({
-      placement: { type: "output", output: "timeout-test", anchor: "fill" },
-      initializationTimeoutMs: 100
-    }),
-    /Timed out while discovering Wayland globals/
-  );
-  assert.ok(Date.now() - timeoutStarted < 2_000, "native initialization timeout was not bounded");
-} finally {
-  process.env.WAYLAND_DISPLAY = compositorDisplay;
-  for (const socket of stalledConnections) socket.destroy();
-  await new Promise((resolveClose) => stalledServer.close(resolveClose));
+if (app.commandLine.getSwitchValue("ozone-platform") !== "wayland") {
+  throw new Error("Electron must run with --ozone-platform=wayland.");
 }
 
-const capabilities = getLayerShellCapabilities();
-if (!capabilities.aboveFullscreen || !capabilities.outputPlacement || capabilities.globalPositioning) {
-  throw new Error(`Unexpected layer-shell capabilities: ${JSON.stringify(capabilities)}`);
+const watchdog = setTimeout(() => {
+  console.error("Electron OSR layer-shell smoke test timed out.");
+  app.exit(1);
+}, 30_000);
+
+main().then(() => {
+  clearTimeout(watchdog);
+  app.quit();
+}).catch((error) => {
+  console.error(error);
+  clearTimeout(watchdog);
+  app.exit(1);
+});
+
+async function main() {
+  console.log("Waiting for Electron app readiness.");
+  await app.whenReady();
+  console.log("Creating native layer-shell surface.");
+
+  const capabilities = getLayerShellCapabilities();
+  assert.equal(capabilities.renderingMode, "electron-offscreen");
+  assert.equal(capabilities.aboveFullscreen, true);
+  assert.equal(capabilities.outputPlacement, true);
+  assert.equal(capabilities.globalPositioning, false);
+
+  const requestedOutput = process.env.LAYER_SHELL_OUTPUT;
+  if (!requestedOutput) throw new Error("LAYER_SHELL_OUTPUT is required.");
+  let timerFired = false;
+  setTimeout(() => { timerFired = true; }, 0);
+  const overlayPromise = createLayerShellOverlay({
+    placement: { type: "output", output: requestedOutput, anchor: "fill" },
+    namespace: "covas-electron-overlay-osr-smoke",
+    initializationTimeoutMs: 10_000
+  });
+  await delay(0);
+  assert.equal(timerFired, true, "layer-shell initialization blocked the JavaScript event loop");
+  const overlay = await overlayPromise;
+  const initialState = overlay.getState();
+  assert.deepEqual([initialState.width, initialState.height], [1920, 1080]);
+  console.log(`Creating ${initialState.width}x${initialState.height} offscreen BrowserWindow.`);
+
+  const window = new BrowserWindow({
+    width: initialState.width,
+    height: initialState.height,
+    show: false,
+    frame: false,
+    transparent: true,
+    backgroundColor: "#00000000",
+    webPreferences: {
+      backgroundThrottling: false,
+      offscreen: {
+        useSharedTexture: false,
+        deviceScaleFactor: 1
+      }
+    }
+  });
+  let latestPaintChecksum = 0;
+  window.webContents.setFrameRate(30);
+  window.webContents.on("paint", (_event, _dirtyRect, image) => {
+    latestPaintChecksum = checksum(image.toBitmap({ scaleFactor: 1 }));
+  });
+  overlay.attachOffscreenWindow(window);
+
+  try {
+    console.log("Loading Electron offscreen renderer.");
+    await window.loadURL(`data:text/html,${encodeURIComponent(`
+      <style>
+        html, body { width: 100%; height: 100%; margin: 0; overflow: hidden; background: transparent; }
+        body { background: linear-gradient(90deg, rgba(255,0,0,.75) 0 25%, #00ff00 25% 50%, #0000ff 50% 75%, transparent 75%); }
+      </style>
+    `)}`);
+    await waitForFrame(overlay, requestedOutput, () => latestPaintChecksum);
+    console.log("Received initial Electron offscreen frame.");
+    const firstSubmitted = overlay.getState().submittedFrameCount;
+
+    const firstFrameCount = overlay.getState().frameCount;
+    await window.webContents.executeJavaScript(
+      "document.body.style.background = 'rgba(32, 96, 192, 0.5)'"
+    );
+    window.webContents.invalidate();
+    await waitUntil(() => {
+      const state = overlay.getState();
+      if (state.error || state.renderError) throw new Error(state.error ?? state.renderError);
+      return state.submittedFrameCount > firstSubmitted
+        && state.frameCount > firstFrameCount
+        && state.lastFrameChecksum === latestPaintChecksum;
+    }, "updated Electron OSR frame");
+
+    const beforeResize = overlay.getState();
+    await execFileAsync("swaymsg", ["output", requestedOutput, "mode", "1280x720"]);
+    try {
+      await waitUntil(() => {
+        const state = overlay.getState();
+        if (state.error || state.renderError) throw new Error(state.error ?? state.renderError);
+        return state.width === 1280
+          && state.height === 720
+          && state.submittedFrameCount > beforeResize.submittedFrameCount
+          && state.frameCount > beforeResize.frameCount
+          && state.lastFrameChecksum === latestPaintChecksum;
+      }, "OSR repaint after compositor output resize");
+    } catch (error) {
+      throw new Error(`${error} State: ${JSON.stringify(overlay.getState())}; BrowserWindow: ${window.getContentSize()}; paint checksum: ${latestPaintChecksum}`);
+    }
+
+    const state = overlay.getState();
+    assert.equal(state.output, requestedOutput);
+    assert.equal(state.sourceAttached, true);
+    assert.equal(state.renderError, undefined);
+    assert.ok(state.frameCount >= 4);
+    assert.ok(state.bufferReleaseCount >= 3);
+    console.log(`Rendered Electron OSR through wl_shm: ${JSON.stringify(state)}`);
+  } finally {
+    overlay.close();
+    const closedState = overlay.getState();
+    assert.equal(closedState.closed, true);
+    assert.equal(closedState.mapped, false);
+    assert.equal(closedState.sourceAttached, false);
+    window.destroy();
+  }
 }
 
-const requestedOutput = process.env.LAYER_SHELL_OUTPUT;
-if (!requestedOutput) throw new Error("LAYER_SHELL_OUTPUT is required.");
-let timerFired = false;
-setTimeout(() => { timerFired = true; }, 0);
-const overlayPromise = createLayerShellOverlay({
-  placement: { type: "output", output: requestedOutput, anchor: "fill" },
-  namespace: "covas-electron-overlay-smoke",
-  initializationTimeoutMs: 10_000
-});
-await delay(0);
-if (!timerFired) throw new Error("Layer-shell initialization blocked the JavaScript event loop.");
-const overlay = await overlayPromise;
+async function waitForFrame(overlay, expectedOutput, currentChecksum) {
+  await waitUntil(() => {
+    const state = overlay.getState();
+    if (state.error || state.renderError) throw new Error(state.error ?? state.renderError);
+    return state.configured && state.mapped
+      && state.output === expectedOutput
+      && state.submittedFrameCount >= 1
+      && state.lastFrameChecksum !== 0
+      && state.lastFrameChecksum === currentChecksum();
+  }, "initial Electron OSR frame");
+}
 
-try {
+async function waitUntil(condition, description) {
   const deadline = Date.now() + 10_000;
   while (Date.now() < deadline) {
-    const state = overlay.getState();
-    if (state.error) throw new Error(state.error);
-    if (state.configured && state.mapped && state.frameCount >= 2 && state.bufferReleaseCount >= 1) {
-      if (requestedOutput && state.output !== requestedOutput) {
-        throw new Error(`Expected output ${requestedOutput}, got ${state.output ?? "none"}.`);
-      }
-      console.log(`Mapped layer-shell test surface: ${JSON.stringify(state)}`);
-      process.exitCode = 0;
-      break;
-    }
+    if (condition()) return;
     await delay(25);
   }
-  const state = overlay.getState();
-  if (state.frameCount < 2 || state.bufferReleaseCount < 1) {
-    throw new Error(`Layer-shell frame lifecycle timed out: ${JSON.stringify(state)}`);
-  }
-} finally {
-  overlay.close();
-  const closedState = overlay.getState();
-  assert.equal(closedState.closed, true);
-  assert.equal(closedState.mapped, false);
+  throw new Error(`Timed out waiting for ${description}.`);
+}
+
+function checksum(buffer) {
+  let value = 2166136261;
+  for (const byte of buffer) value = Math.imul(value ^ byte, 16777619) >>> 0;
+  return value;
 }

@@ -86,9 +86,13 @@ jobs:
           if-no-files-found: warn
 
   layer-shell:
-    name: Native layer-shell smoke (Sway)
+    name: Native layer-shell smoke (Sway, Electron ${{ matrix.electron }})
     runs-on: ubuntu-24.04
     timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        electron: [locked, 37.0.0]
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-node@v6
@@ -98,7 +102,11 @@ jobs:
       - name: Install native and compositor dependencies
         run: sudo apt-get update && sudo apt-get install -y libwayland-dev libx11-dev libxext-dev libxfixes-dev sway wayland-utils ripgrep
       - run: npm ci
+      - name: Install minimum supported Electron
+        if: matrix.electron != 'locked'
+        run: npm install --no-save --ignore-scripts electron@${{ matrix.electron }}
       - run: npm run build
+      - run: npm run test:types
       - run: npm run rebuild:electron
       - run: node ./node_modules/electron/install.js
       - name: Layer-shell smoke test
@@ -109,6 +117,6 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: layer-shell-smoke-logs
+          name: layer-shell-smoke-logs-electron-${{ matrix.electron }}
           path: ${{ runner.temp }}/layer-shell-smoke-logs
           if-no-files-found: warn

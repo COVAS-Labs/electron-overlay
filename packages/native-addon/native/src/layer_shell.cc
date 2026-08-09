@@ -4,6 +4,7 @@
 #include <atomic>
 #include <cerrno>
 #include <chrono>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <deque>
@@ -18,6 +19,7 @@
 
 #include <fcntl.h>
 #include <sys/mman.h>
+#include <sys/eventfd.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
@@ -56,6 +58,14 @@ struct ShmBuffer {
   uint32_t height = 0;
   bool active = false;
   bool released = true;
+  uint64_t generation = 0;
+};
+
+struct PendingFrame {
+  std::vector<uint8_t> pixels;
+  uint32_t width = 0;
+  uint32_t height = 0;
+  uint64_t generation = 0;
 };
 
 class LayerShellController : public Napi::ObjectWrap<LayerShellController> {
@@ -63,6 +73,7 @@ class LayerShellController : public Napi::ObjectWrap<LayerShellController> {
   static Napi::Function Define(Napi::Env env) {
     return DefineClass(env, "LayerShellController", {
       InstanceMethod("initialize", &LayerShellController::InitializeMethod),
+      InstanceMethod("submitFrame", &LayerShellController::SubmitFrame),
       InstanceMethod("getState", &LayerShellController::GetState),
       InstanceMethod("close", &LayerShellController::CloseMethod)
     });
@@ -203,6 +214,8 @@ class LayerShellController : public Napi::ObjectWrap<LayerShellController> {
     }
     if (!GetError().empty()) throw std::runtime_error(GetError());
     wl_display_flush(display_);
+    wakeFd_ = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+    if (wakeFd_ < 0) throw std::runtime_error("Could not create the layer-shell frame wake descriptor.");
     dispatchThread_ = std::thread([this] { DispatchLoop(); });
   }
 
@@ -293,21 +306,8 @@ class LayerShellController : public Napi::ObjectWrap<LayerShellController> {
   }
 
   std::pair<ShmBuffer*, ShmBuffer*> CreateBuffers(uint32_t width, uint32_t height) {
-    if (width == 0 || height == 0) {
-      const Output* fallback = selectedOutputInfo_;
-      if (width == 0) {
-        width = fallback && fallback->width
-            ? fallback->width / static_cast<uint32_t>(std::max(fallback->scale, 1))
-            : width_.load();
-      }
-      if (height == 0) {
-        height = fallback && fallback->height
-            ? fallback->height / static_cast<uint32_t>(std::max(fallback->scale, 1))
-            : height_.load();
-      }
-      if (width == 0) width = 1;
-      if (height == 0) height = 1;
-    }
+    ResolveConfiguredSize(width, height);
+    ClearError();
     const uint64_t stride64 = static_cast<uint64_t>(width) * 4;
     const uint64_t size64 = stride64 * height;
     if (stride64 > INT32_MAX || size64 > INT32_MAX || size64 > SIZE_MAX) {
@@ -315,63 +315,87 @@ class LayerShellController : public Napi::ObjectWrap<LayerShellController> {
       return { nullptr, nullptr };
     }
 
-    width_ = width;
-    height_ = height;
-    for (const std::unique_ptr<ShmBuffer>& buffer : buffers_) buffer->active = false;
-    CollectReleasedBuffers();
     const int32_t stride = static_cast<int32_t>(stride64);
     static const wl_buffer_listener bufferListener = { BufferRelease };
-
+    const uint64_t generation = nextGeneration_++;
+    std::vector<std::unique_ptr<ShmBuffer>> newBuffers;
+    const auto cleanupNewBuffers = [this, &newBuffers] {
+      for (const std::unique_ptr<ShmBuffer>& buffer : newBuffers) DestroyBuffer(*buffer);
+    };
     ShmBuffer* created[2] = { nullptr, nullptr };
     for (uint32_t index = 0; index < 2; index += 1) {
       auto storage = std::make_unique<ShmBuffer>();
-      buffers_.push_back(std::move(storage));
-      ShmBuffer& buffer = *buffers_.back();
+      ShmBuffer& buffer = *storage;
       buffer.owner = this;
       buffer.index = index;
       buffer.width = width;
       buffer.height = height;
       buffer.active = true;
+      buffer.generation = generation;
       buffer.size = static_cast<size_t>(size64);
       buffer.fd = memfd_create("electron-overlay-layer-shell", MFD_CLOEXEC);
       if (buffer.fd < 0 || ftruncate(buffer.fd, static_cast<off_t>(buffer.size)) < 0) {
         SetError(std::string("Could not allocate a Wayland shared-memory file: ") + std::strerror(errno));
+        DestroyBuffer(buffer);
+        cleanupNewBuffers();
         return { nullptr, nullptr };
       }
       buffer.data = mmap(nullptr, buffer.size, PROT_READ | PROT_WRITE, MAP_SHARED, buffer.fd, 0);
       if (buffer.data == MAP_FAILED) {
         SetError(std::string("Could not map a Wayland shared-memory buffer: ") + std::strerror(errno));
+        DestroyBuffer(buffer);
+        cleanupNewBuffers();
         return { nullptr, nullptr };
       }
       wl_shm_pool* pool = wl_shm_create_pool(shm_, buffer.fd, static_cast<int32_t>(buffer.size));
+      if (!pool) {
+        SetError("Could not create a Wayland shared-memory pool.");
+        DestroyBuffer(buffer);
+        cleanupNewBuffers();
+        return { nullptr, nullptr };
+      }
       buffer.proxy = wl_shm_pool_create_buffer(
           pool, 0, static_cast<int32_t>(width), static_cast<int32_t>(height),
           stride, WL_SHM_FORMAT_ARGB8888);
       wl_shm_pool_destroy(pool);
       if (!buffer.proxy) {
         SetError("Could not create a Wayland shared-memory buffer.");
+        DestroyBuffer(buffer);
+        cleanupNewBuffers();
         return { nullptr, nullptr };
       }
       wl_buffer_add_listener(buffer.proxy, &bufferListener, &buffer);
-      PaintTestPattern(buffer);
+      std::memset(buffer.data, 0, buffer.size);
       created[index] = &buffer;
+      newBuffers.push_back(std::move(storage));
+    }
+
+    for (const std::unique_ptr<ShmBuffer>& buffer : buffers_) buffer->active = false;
+    CollectReleasedBuffers();
+    for (std::unique_ptr<ShmBuffer>& buffer : newBuffers) buffers_.push_back(std::move(buffer));
+    width_ = width;
+    height_ = height;
+    {
+      std::lock_guard<std::mutex> lock(frameMutex_);
+      configuredGeneration_ = generation;
+      configuredWidth_ = width;
+      configuredHeight_ = height;
+      acceptingFrames_ = true;
+      if (pendingFrame_) {
+        pendingFrame_.reset();
+        droppedFrameCount_ += 1;
+      }
     }
     return { created[0], created[1] };
   }
 
-  void PaintTestPattern(ShmBuffer& buffer) {
-    auto* pixels = static_cast<uint32_t*>(buffer.data);
-    const uint32_t accent = buffer.index == 0 ? 0x80602000u : 0x80204060u;
-    const uint32_t width = buffer.width;
-    const uint32_t height = buffer.height;
-    const uint32_t boxWidth = std::min(width, 160u);
-    const uint32_t boxHeight = std::min(height, 90u);
-    std::fill(pixels, pixels + (buffer.size / sizeof(uint32_t)), 0u);
-    for (uint32_t y = 0; y < boxHeight; y += 1) {
-      for (uint32_t x = 0; x < boxWidth; x += 1) {
-        pixels[static_cast<size_t>(y) * width + x] = accent;
-      }
-    }
+  void DestroyBuffer(ShmBuffer& buffer) {
+    if (buffer.proxy) wl_buffer_destroy(buffer.proxy);
+    if (buffer.data != MAP_FAILED) munmap(buffer.data, buffer.size);
+    if (buffer.fd >= 0) close(buffer.fd);
+    buffer.proxy = nullptr;
+    buffer.data = MAP_FAILED;
+    buffer.fd = -1;
   }
 
   void AttachFrame(ShmBuffer* buffer, bool requestNextFrame) {
@@ -391,30 +415,117 @@ class LayerShellController : public Napi::ObjectWrap<LayerShellController> {
   }
 
   void DispatchLoop() {
-    const int fd = wl_display_get_fd(display_);
+    const int displayFd = wl_display_get_fd(display_);
     while (!stop_) {
-      pollfd descriptor = { fd, POLLIN, 0 };
-      const int ready = poll(&descriptor, 1, 100);
-      if (ready > 0 && (descriptor.revents & POLLIN)) {
-        if (wl_display_dispatch(display_) < 0 && !stop_) {
-          SetError("The Wayland compositor disconnected.");
-          compositorClosed_ = true;
-          mapped_ = false;
+      if (wl_display_dispatch_pending(display_) < 0) {
+        HandleDisplayFailure("The Wayland compositor disconnected.");
+        break;
+      }
+      PumpFrame();
+      bool needsWrite = false;
+      if (wl_display_flush(display_) < 0) {
+        if (errno == EAGAIN) needsWrite = true;
+        else {
+          HandleDisplayFailure(std::string("Could not flush the Wayland connection: ") + std::strerror(errno));
           break;
         }
-      } else if (ready > 0 && (descriptor.revents & (POLLERR | POLLHUP | POLLNVAL))) {
-        SetError("The Wayland compositor disconnected.");
-        compositorClosed_ = true;
-        mapped_ = false;
-        break;
-      } else if (ready < 0 && errno != EINTR) {
-        SetError(std::string("Could not poll the Wayland connection: ") + std::strerror(errno));
-        break;
-      } else {
-        wl_display_dispatch_pending(display_);
       }
-      wl_display_flush(display_);
+      pollfd descriptors[2] = {
+        { displayFd, static_cast<short>(POLLIN | (needsWrite ? POLLOUT : 0)), 0 },
+        { wakeFd_, POLLIN, 0 }
+      };
+      const int ready = poll(descriptors, 2, -1);
+      if (ready < 0) {
+        if (errno == EINTR) continue;
+        HandleDisplayFailure(std::string("Could not poll the Wayland connection: ") + std::strerror(errno));
+        break;
+      }
+      if (descriptors[0].revents & POLLIN) {
+        if (wl_display_dispatch(display_) < 0 && !stop_) {
+          HandleDisplayFailure("The Wayland compositor disconnected.");
+          break;
+        }
+      } else if (descriptors[0].revents & (POLLERR | POLLHUP | POLLNVAL)) {
+        HandleDisplayFailure("The Wayland compositor disconnected.");
+        break;
+      }
+      if (descriptors[0].revents & POLLOUT) {
+        if (wl_display_flush(display_) < 0 && errno != EAGAIN) {
+          HandleDisplayFailure(std::string("Could not flush the Wayland connection: ") + std::strerror(errno));
+          break;
+        }
+      }
+      if (descriptors[1].revents & (POLLERR | POLLHUP | POLLNVAL)) {
+        HandleDisplayFailure("The layer-shell frame wake descriptor failed.");
+        break;
+      }
+      if (descriptors[1].revents & POLLIN) DrainWake();
     }
+  }
+
+  void PumpFrame() {
+    if (stop_ || compositorClosed_ || !configured_ || frameCallback_) return;
+    std::unique_ptr<PendingFrame> frame;
+    ShmBuffer* target = nullptr;
+    {
+      std::lock_guard<std::mutex> lock(frameMutex_);
+      if (!pendingFrame_) return;
+      if (pendingFrame_->generation != configuredGeneration_
+          || pendingFrame_->width != configuredWidth_
+          || pendingFrame_->height != configuredHeight_) {
+        pendingFrame_.reset();
+        droppedFrameCount_ += 1;
+        return;
+      }
+      const auto available = std::find_if(buffers_.begin(), buffers_.end(), [this](const auto& buffer) {
+        return buffer->active && buffer->released
+            && buffer->generation == configuredGeneration_;
+      });
+      if (available == buffers_.end()) return;
+      target = available->get();
+      frame = std::move(pendingFrame_);
+    }
+    std::memcpy(target->data, frame->pixels.data(), frame->pixels.size());
+    uint32_t checksum = 2166136261u;
+    for (const uint8_t byte : frame->pixels) checksum = (checksum ^ byte) * 16777619u;
+    AttachFrame(target, true);
+    lastFrameChecksum_ = checksum;
+  }
+
+  void SignalWake() {
+    if (wakeFd_ < 0) return;
+    const uint64_t value = 1;
+    while (write(wakeFd_, &value, sizeof(value)) < 0 && errno == EINTR) {}
+  }
+
+  void DrainWake() {
+    uint64_t value;
+    while (read(wakeFd_, &value, sizeof(value)) < 0 && errno == EINTR) {}
+  }
+
+  void HandleDisplayFailure(std::string error) {
+    SetError(std::move(error));
+    compositorClosed_ = true;
+    mapped_ = false;
+    std::lock_guard<std::mutex> lock(frameMutex_);
+    acceptingFrames_ = false;
+    pendingFrame_.reset();
+  }
+
+  void ResolveConfiguredSize(uint32_t& width, uint32_t& height) const {
+    const Output* fallback = selectedOutputInfo_;
+    if (width == 0) {
+      width = fallback && fallback->width
+          ? fallback->width / static_cast<uint32_t>(std::max(fallback->scale, 1))
+          : width_.load();
+    }
+    if (height == 0) {
+      height = fallback && fallback->height
+          ? fallback->height / static_cast<uint32_t>(std::max(fallback->scale, 1))
+          : height_.load();
+    }
+    if (width == 0) width = 1;
+    if (height == 0) height = 1;
   }
 
   void CollectReleasedBuffers() {
@@ -423,26 +534,30 @@ class LayerShellController : public Napi::ObjectWrap<LayerShellController> {
     };
     for (const std::unique_ptr<ShmBuffer>& buffer : buffers_) {
       if (!removable(buffer)) continue;
-      if (buffer->proxy) wl_buffer_destroy(buffer->proxy);
-      if (buffer->data != MAP_FAILED) munmap(buffer->data, buffer->size);
-      if (buffer->fd >= 0) close(buffer->fd);
+      DestroyBuffer(*buffer);
     }
     buffers_.erase(std::remove_if(buffers_.begin(), buffers_.end(), removable), buffers_.end());
   }
 
   void Close() {
     if (closed_.exchange(true)) return;
-    stop_ = true;
+    {
+      std::lock_guard<std::mutex> lock(frameMutex_);
+      acceptingFrames_ = false;
+      pendingFrame_.reset();
+      stop_ = true;
+      SignalWake();
+    }
     mapped_ = false;
     if (dispatchThread_.joinable()) dispatchThread_.join();
+    if (wakeFd_ >= 0) close(wakeFd_);
+    wakeFd_ = -1;
     mapped_ = false;
 
     if (frameCallback_) wl_callback_destroy(frameCallback_);
     frameCallback_ = nullptr;
     for (const std::unique_ptr<ShmBuffer>& buffer : buffers_) {
-      if (buffer->proxy) wl_buffer_destroy(buffer->proxy);
-      if (buffer->data != MAP_FAILED) munmap(buffer->data, buffer->size);
-      if (buffer->fd >= 0) close(buffer->fd);
+      DestroyBuffer(*buffer);
     }
     if (layerSurface_) zwlr_layer_surface_v1_destroy(layerSurface_);
     if (surface_) wl_surface_destroy(surface_);
@@ -460,6 +575,69 @@ class LayerShellController : public Napi::ObjectWrap<LayerShellController> {
     display_ = nullptr;
   }
 
+  Napi::Value SubmitFrame(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() != 3 || !info[0].IsBuffer() || !info[1].IsNumber() || !info[2].IsNumber()) {
+      Napi::TypeError::New(env, "submitFrame expects a Buffer, width, and height.")
+          .ThrowAsJavaScriptException();
+      return env.Undefined();
+    }
+    const double widthValue = info[1].As<Napi::Number>().DoubleValue();
+    const double heightValue = info[2].As<Napi::Number>().DoubleValue();
+    if (!std::isfinite(widthValue) || !std::isfinite(heightValue)
+        || widthValue <= 0 || heightValue <= 0
+        || std::floor(widthValue) != widthValue || std::floor(heightValue) != heightValue
+        || widthValue > UINT32_MAX || heightValue > UINT32_MAX) {
+      Napi::RangeError::New(env, "Frame width and height must be positive 32-bit integers.")
+          .ThrowAsJavaScriptException();
+      return env.Undefined();
+    }
+    const uint32_t width = static_cast<uint32_t>(widthValue);
+    const uint32_t height = static_cast<uint32_t>(heightValue);
+    if (width > static_cast<uint64_t>(INT32_MAX) / 4
+        || height > static_cast<uint64_t>(INT32_MAX) / (static_cast<uint64_t>(width) * 4)) {
+      Napi::RangeError::New(env, "Frame dimensions exceed the wl_shm buffer size limit.")
+          .ThrowAsJavaScriptException();
+      return env.Undefined();
+    }
+    const uint64_t expectedSize = static_cast<uint64_t>(width) * height * 4;
+    const Napi::Buffer<uint8_t> source = info[0].As<Napi::Buffer<uint8_t>>();
+    if (expectedSize > SIZE_MAX || source.Length() != expectedSize) {
+      Napi::RangeError::New(env, "Frame Buffer length must equal width * height * 4.")
+          .ThrowAsJavaScriptException();
+      return env.Undefined();
+    }
+    uint64_t generation = 0;
+    {
+      std::lock_guard<std::mutex> lock(frameMutex_);
+      if (!acceptingFrames_ || closed_ || compositorClosed_) return Napi::Boolean::New(env, false);
+      if (width != configuredWidth_ || height != configuredHeight_) {
+        droppedFrameCount_ += 1;
+        return Napi::Boolean::New(env, false);
+      }
+      generation = configuredGeneration_;
+    }
+    auto frame = std::make_unique<PendingFrame>();
+    frame->pixels.assign(source.Data(), source.Data() + source.Length());
+    frame->width = width;
+    frame->height = height;
+    frame->generation = generation;
+    {
+      std::lock_guard<std::mutex> lock(frameMutex_);
+      if (!acceptingFrames_ || closed_ || compositorClosed_
+          || width != configuredWidth_ || height != configuredHeight_
+          || generation != configuredGeneration_) {
+        droppedFrameCount_ += 1;
+        return Napi::Boolean::New(env, false);
+      }
+      if (pendingFrame_) droppedFrameCount_ += 1;
+      pendingFrame_ = std::move(frame);
+      submittedFrameCount_ += 1;
+      SignalWake();
+    }
+    return Napi::Boolean::New(env, true);
+  }
+
   Napi::Value GetState(const Napi::CallbackInfo& info) {
     if (initializing_) {
       Napi::Error::New(info.Env(), "Cannot read layer-shell state while it is initializing.")
@@ -475,6 +653,9 @@ class LayerShellController : public Napi::ObjectWrap<LayerShellController> {
     state.Set("height", height_.load());
     state.Set("frameCount", frameCount_.load());
     state.Set("bufferReleaseCount", bufferReleaseCount_.load());
+    state.Set("submittedFrameCount", submittedFrameCount_.load());
+    state.Set("droppedFrameCount", droppedFrameCount_.load());
+    state.Set("lastFrameChecksum", lastFrameChecksum_.load());
     if (selectedOutput_.empty()) state.Set("output", info.Env().Undefined());
     else state.Set("output", selectedOutput_);
     const std::string error = GetError();
@@ -500,6 +681,11 @@ class LayerShellController : public Napi::ObjectWrap<LayerShellController> {
   std::string GetError() {
     std::lock_guard<std::mutex> lock(errorMutex_);
     return error_;
+  }
+
+  void ClearError() {
+    std::lock_guard<std::mutex> lock(errorMutex_);
+    error_.clear();
   }
 
   static void SyncDone(void* data, wl_callback*, uint32_t) {
@@ -562,14 +748,23 @@ class LayerShellController : public Napi::ObjectWrap<LayerShellController> {
                              uint32_t serial, uint32_t width, uint32_t height) {
     auto* self = static_cast<LayerShellController*>(data);
     zwlr_layer_surface_v1_ack_configure(surface, serial);
-    if (width == self->width_ && height == self->height_ && self->configured_) return;
+    self->ResolveConfiguredSize(width, height);
+    if (width == self->width_ && height == self->height_ && self->configured_
+        && self->GetError().empty()) return;
+    {
+      std::lock_guard<std::mutex> lock(self->frameMutex_);
+      self->acceptingFrames_ = false;
+      if (self->pendingFrame_) {
+        self->pendingFrame_.reset();
+        self->droppedFrameCount_ += 1;
+      }
+    }
     if (self->frameCallback_) {
       wl_callback_destroy(self->frameCallback_);
       self->frameCallback_ = nullptr;
     }
     const auto [first, second] = self->CreateBuffers(width, height);
     if (self->GetError().empty() && first && second) {
-      self->nextFrameBuffer_ = second;
       self->configured_ = true;
       self->AttachFrame(first, true);
     }
@@ -579,6 +774,9 @@ class LayerShellController : public Napi::ObjectWrap<LayerShellController> {
     auto* self = static_cast<LayerShellController*>(data);
     self->compositorClosed_ = true;
     self->mapped_ = false;
+    std::lock_guard<std::mutex> lock(self->frameMutex_);
+    self->acceptingFrames_ = false;
+    self->pendingFrame_.reset();
   }
 
   static void FrameDone(void* data, wl_callback* callback, uint32_t) {
@@ -586,16 +784,16 @@ class LayerShellController : public Napi::ObjectWrap<LayerShellController> {
     wl_callback_destroy(callback);
     self->frameCallback_ = nullptr;
     if (self->stop_ || self->compositorClosed_) return;
-    ShmBuffer* next = self->nextFrameBuffer_;
-    self->nextFrameBuffer_ = nullptr;
-    self->AttachFrame(next, false);
+    self->PumpFrame();
   }
 
   static void BufferRelease(void* data, wl_buffer*) {
     auto* buffer = static_cast<ShmBuffer*>(data);
+    LayerShellController* owner = buffer->owner;
     buffer->released = true;
-    buffer->owner->bufferReleaseCount_ += 1;
-    buffer->owner->CollectReleasedBuffers();
+    owner->bufferReleaseCount_ += 1;
+    owner->CollectReleasedBuffers();
+    owner->PumpFrame();
   }
 
   wl_display* display_ = nullptr;
@@ -607,10 +805,11 @@ class LayerShellController : public Napi::ObjectWrap<LayerShellController> {
   wl_surface* surface_ = nullptr;
   zwlr_layer_surface_v1* layerSurface_ = nullptr;
   wl_callback* frameCallback_ = nullptr;
-  ShmBuffer* nextFrameBuffer_ = nullptr;
+  int wakeFd_ = -1;
   std::deque<Output> outputs_;
   Output* selectedOutputInfo_ = nullptr;
   std::vector<std::unique_ptr<ShmBuffer>> buffers_;
+  uint64_t nextGeneration_ = 1;
   std::thread dispatchThread_;
   std::string requestedOutput_;
   std::string selectedOutput_;
@@ -619,6 +818,12 @@ class LayerShellController : public Napi::ObjectWrap<LayerShellController> {
   std::chrono::steady_clock::time_point initializationDeadline_;
   std::mutex errorMutex_;
   std::string error_;
+  std::mutex frameMutex_;
+  std::unique_ptr<PendingFrame> pendingFrame_;
+  uint64_t configuredGeneration_ = 0;
+  uint32_t configuredWidth_ = 0;
+  uint32_t configuredHeight_ = 0;
+  bool acceptingFrames_ = false;
   std::atomic<bool> stop_{false};
   std::atomic<bool> initializationStarted_{false};
   std::atomic<bool> initializing_{false};
@@ -630,6 +835,9 @@ class LayerShellController : public Napi::ObjectWrap<LayerShellController> {
   std::atomic<uint32_t> height_{0};
   std::atomic<uint32_t> frameCount_{0};
   std::atomic<uint32_t> bufferReleaseCount_{0};
+  std::atomic<uint32_t> submittedFrameCount_{0};
+  std::atomic<uint32_t> droppedFrameCount_{0};
+  std::atomic<uint32_t> lastFrameChecksum_{0};
 };
 
 Napi::Value CreateLayerShellOverlay(const Napi::CallbackInfo& info) {

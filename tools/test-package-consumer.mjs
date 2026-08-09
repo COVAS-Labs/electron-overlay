@@ -43,6 +43,8 @@ assert.ok(process.versions.electron, "consumer must run under Electron");
 const overlay = await import(${JSON.stringify(artifacts.public.package)});
 assert.equal(typeof overlay.configure, "function");
 assert.equal(typeof overlay.createLayerShellOverlay, "function");
+assert.equal(typeof overlay.LayerShellOverlayController.prototype.attachOffscreenWindow, "function");
+assert.equal(overlay.getLayerShellCapabilities().renderingMode, "electron-offscreen");
 assert.deepEqual(
   overlay.displayToNativeRect({ bounds: { x: 1, y: 2, width: 3, height: 4 }, scaleFactor: 1 }),
   { x: 1, y: 2, width: 3, height: 4 }
@@ -57,6 +59,9 @@ if (process.platform === "linux") {
   const consumerRequire = createRequire(import.meta.url);
   const layerShell = consumerRequire(${JSON.stringify(`${artifacts.prebuilt.package}/wayland_layer_shell.node`)});
   assert.equal(typeof layerShell.createLayerShellOverlay, "function");
+  const controller = layerShell.createLayerShellOverlay({});
+  assert.equal(typeof controller.submitFrame, "function");
+  controller.close();
 }
 console.log("Loaded ${artifacts.prebuilt.package} through ${artifacts.public.package} under Electron.");
 `;

@@ -107,9 +107,10 @@ The compatibility backend reports `aboveFullscreen: false`, `externalParent: fal
 
 ## Experimental layer-shell surface
 
-`createLayerShellOverlay()` owns a new native Wayland surface instead of accepting a `BrowserWindow`:
+`createLayerShellOverlay()` owns a new native Wayland surface. Bind a separately created offscreen `BrowserWindow` after the compositor has configured the output size:
 
 ```ts
+import { BrowserWindow } from 'electron';
 import {
   createLayerShellOverlay,
   getLayerShellCapabilities
@@ -127,13 +128,41 @@ const overlay = await createLayerShellOverlay({
   initializationTimeoutMs: 5000
 });
 
+const window = new BrowserWindow({
+  width: overlay.getState().width,
+  height: overlay.getState().height,
+  show: false,
+  transparent: true,
+  webPreferences: {
+    offscreen: {
+      useSharedTexture: false,
+      deviceScaleFactor: 1
+    }
+  }
+});
+
+overlay.attachOffscreenWindow(window);
+await window.loadURL(overlayUrl);
+
 console.log(overlay.getState());
 overlay.close();
+window.destroy();
 ```
 
-The surface uses the overlay layer, exclusive zone `-1`, keyboard interactivity `none`, and an empty input region. The current implementation renders only a deterministic two-frame `wl_shm` test pattern. It validates native surface, output selection, configure, frame, buffer-release, and teardown behavior; Electron OSR content rendering is not implemented yet.
+The surface uses the overlay layer, exclusive zone `-1`, keyboard interactivity `none`, and an empty input region. Electron's `paint` event supplies complete bitmap frames through `NativeImage.toBitmap({ scaleFactor: 1 })`. On little-endian Linux those premultiplied BGRA bytes map to `WL_SHM_FORMAT_ARGB8888`. The first implementation copies complete frames; dirty-rectangle updates and DMA-BUF are future optimizations.
+
+`attachOffscreenWindow()` sizes the renderer to the compositor configuration, requests an initial frame, follows later size changes on paint, removes listeners on close or rebind, and closes the layer surface if the renderer is destroyed. When both native buffers are busy, only the newest uncommitted frame is retained. The controller never destroys the caller's BrowserWindow.
 
 The API fails explicitly on non-Linux systems, when the Linux layer-shell binary is unavailable, when the compositor does not advertise `zwlr_layer_shell_v1`, or when the required output name is absent. Initialization defaults to a five-second deadline. Use `wayland-electron` as the application-level fallback.
+
+Layer-shell controller methods:
+
+```ts
+attachOffscreenWindow(window): void
+getState(): LayerShellOverlayState
+getCapabilities(): LayerShellCapabilities
+close(): void
+```
 
 ## Controller API
 

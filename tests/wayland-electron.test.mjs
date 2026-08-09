@@ -58,7 +58,7 @@ test("reports separate layer-shell capabilities", () => {
     outputPlacement: true,
     parentPlacement: false,
     keyboardInteractivity: "none",
-    renderingMode: "test-pattern"
+    renderingMode: "electron-offscreen"
   });
   assert.equal(typeof createLayerShellOverlay, "function");
 });

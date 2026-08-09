@@ -20,6 +20,7 @@ unset DISPLAY WAYLAND_DISPLAY SWAYSOCK
 
 sway_log="$log_dir/sway.log"
 client_log="$log_dir/client.log"
+native_client_log="$log_dir/native-client.log"
 wayland_info_log="$log_dir/wayland-info.log"
 sway_pid=""
 
@@ -32,7 +33,7 @@ cleanup() {
   fi
   rm -rf "$runtime_dir"
   if (( status != 0 )); then
-    for log in "$sway_log" "$wayland_info_log" "$client_log"; do
+    for log in "$sway_log" "$wayland_info_log" "$native_client_log" "$client_log"; do
       if [[ -f "$log" ]]; then
         printf '\n===== %s =====\n' "$log" >&2
         cat "$log" >&2
@@ -58,6 +59,7 @@ done
 
 swaymsg create_output >/dev/null
 export LAYER_SHELL_OUTPUT=HEADLESS-2
+swaymsg output "$LAYER_SHELL_OUTPUT" mode 1920x1080 >/dev/null
 for socket in "$runtime_dir"/wayland-*; do
   if [[ -S "$socket" ]]; then export WAYLAND_DISPLAY="${socket##*/}"; break; fi
 done
@@ -71,6 +73,13 @@ fi
 
 set +e
 ELECTRON_RUN_AS_NODE=1 timeout --signal=TERM --kill-after=10s "${smoke_timeout}s" \
+  npm run test:electron:layer-shell:native 2>&1 | tee "$native_client_log"
+native_status=${PIPESTATUS[0]}
+if (( native_status != 0 )); then
+  set -e
+  exit "$native_status"
+fi
+timeout --signal=TERM --kill-after=10s "${smoke_timeout}s" \
   npm run test:electron:layer-shell 2>&1 | tee "$client_log"
 smoke_status=${PIPESTATUS[0]}
 set -e

@@ -91,7 +91,7 @@ export interface LayerShellCapabilities {
   outputPlacement: boolean;
   parentPlacement: boolean;
   keyboardInteractivity: "none";
-  renderingMode: "test-pattern";
+  renderingMode: "electron-offscreen";
 }
 
 export interface OutputPlacement {
@@ -115,8 +115,42 @@ export interface LayerShellOverlayState {
   height: number;
   frameCount: number;
   bufferReleaseCount: number;
+  submittedFrameCount: number;
+  droppedFrameCount: number;
+  lastFrameChecksum: number;
+  sourceAttached?: boolean;
+  renderError?: string;
   output?: string;
   error?: string;
+}
+
+export interface ElectronOffscreenNativeImageLike {
+  isEmpty(): boolean;
+  getSize(scaleFactor?: number): { width: number; height: number };
+  toBitmap(options?: { scaleFactor?: number }): Buffer;
+}
+
+export type ElectronOffscreenPaintListener = (
+  event: unknown,
+  dirtyRect: NativeRect,
+  image: ElectronOffscreenNativeImageLike
+) => void;
+
+export interface ElectronOffscreenWebContentsLike {
+  isOffscreen(): boolean;
+  isDestroyed(): boolean;
+  invalidate(): void;
+  on(event: "paint", listener: ElectronOffscreenPaintListener): unknown;
+  on(event: "destroyed", listener: () => void): unknown;
+  removeListener(event: "paint", listener: ElectronOffscreenPaintListener): unknown;
+  removeListener(event: "destroyed", listener: () => void): unknown;
+}
+
+export interface ElectronOffscreenBrowserWindowLike {
+  readonly webContents: ElectronOffscreenWebContentsLike;
+  isDestroyed?(): boolean;
+  getContentSize(): number[];
+  setContentSize(width: number, height: number): void;
 }
 
 export interface ElectronBrowserWindowLike {
@@ -159,6 +193,7 @@ interface OverlayBackend {
 
 interface NativeLayerShellController {
   initialize(): Promise<void>;
+  submitFrame(frame: Buffer, width: number, height: number): boolean;
   getState(): LayerShellOverlayState;
   close(): void;
 }
@@ -234,7 +269,7 @@ const LAYER_SHELL_CAPABILITIES: LayerShellCapabilities = {
   outputPlacement: true,
   parentPlacement: false,
   keyboardInteractivity: "none",
-  renderingMode: "test-pattern"
+  renderingMode: "electron-offscreen"
 };
 
 function nativeBackendKind(): "win32" | "macos" | "x11" {
@@ -474,11 +509,136 @@ export class OverlayController {
 }
 
 export class LayerShellOverlayController {
+  private detachSource?: () => void;
+  private sourceAttached = false;
+  private renderError?: string;
+  private closed = false;
+
   constructor(private readonly controller: NativeLayerShellController) {}
 
-  getState(): LayerShellOverlayState { return { ...this.controller.getState() }; }
+  attachOffscreenWindow(window: ElectronOffscreenBrowserWindowLike): void {
+    if (this.closed) throw new Error("Layer-shell overlay controller is closed.");
+    if (!window || typeof window !== "object" || !window.webContents) {
+      throw new TypeError("attachOffscreenWindow requires an Electron offscreen BrowserWindow.");
+    }
+    if (window.isDestroyed?.() || window.webContents.isDestroyed()) {
+      throw new Error("Electron offscreen BrowserWindow is destroyed.");
+    }
+    if (!window.webContents.isOffscreen()) {
+      throw new Error("BrowserWindow must be created with webPreferences.offscreen enabled.");
+    }
+
+    const webContents = window.webContents;
+    let sizeMonitor: NodeJS.Timeout | undefined;
+    let invalidatePending = false;
+    let invalidating = false;
+    const terminalError = (state: LayerShellOverlayState): string | undefined => {
+      if (state.error) return state.error;
+      if (state.compositorClosed) return "The Wayland compositor closed the layer-shell surface.";
+      if (state.closed) return "The layer-shell overlay controller is closed.";
+      return undefined;
+    };
+    const resizeSource = (forceInvalidate = false, allowInvalidate = true) => {
+      const state = this.controller.getState();
+      const error = terminalError(state);
+      if (error) throw new Error(error);
+      const [sourceWidth, sourceHeight] = window.getContentSize();
+      if (state.width !== sourceWidth || state.height !== sourceHeight) {
+        window.setContentSize(state.width, state.height);
+        invalidatePending = true;
+      }
+      if (forceInvalidate) invalidatePending = true;
+      if (allowInvalidate && invalidatePending && !invalidating) {
+        invalidatePending = false;
+        invalidating = true;
+        try {
+          webContents.invalidate();
+        } finally {
+          invalidating = false;
+        }
+      }
+    };
+    const paint: ElectronOffscreenPaintListener = (_event, _dirtyRect, image) => {
+      if (this.closed || image.isEmpty()) return;
+      try {
+        const state = this.controller.getState();
+        const size = image.getSize(1);
+        if (size.width !== state.width || size.height !== state.height) {
+          resizeSource(true, false);
+          return;
+        }
+        const bitmap = image.toBitmap({ scaleFactor: 1 });
+        if (bitmap.length !== size.width * size.height * 4) {
+          this.renderError = "Electron offscreen bitmap length does not match its dimensions.";
+          return;
+        }
+        if (!this.controller.submitFrame(bitmap, size.width, size.height)) {
+          const rejectedState = this.controller.getState();
+          const error = terminalError(rejectedState);
+          if (error) {
+            this.renderError = error;
+            this.close();
+            return;
+          }
+          resizeSource(true);
+          return;
+        }
+        this.renderError = undefined;
+      } catch (error) {
+        this.renderError = String(error);
+      }
+    };
+    const destroyed = () => this.close();
+    const monitorSize = () => {
+      if (this.closed) return;
+      try {
+        resizeSource();
+      } catch (error) {
+        this.renderError = String(error);
+        this.close();
+      }
+    };
+    webContents.on("paint", paint);
+    webContents.on("destroyed", destroyed);
+    const detachNewSource = () => {
+      if (sizeMonitor) clearInterval(sizeMonitor);
+      webContents.removeListener("paint", paint);
+      webContents.removeListener("destroyed", destroyed);
+      if (this.detachSource === detachNewSource) {
+        this.detachSource = undefined;
+        this.sourceAttached = false;
+      }
+    };
+    try {
+      resizeSource(true);
+      if (this.closed) {
+        throw new Error(this.renderError ?? "Layer-shell overlay controller closed while attaching its source.");
+      }
+      sizeMonitor = setInterval(monitorSize, 100);
+      sizeMonitor.unref?.();
+    } catch (error) {
+      detachNewSource();
+      throw error;
+    }
+    this.detachSource?.();
+    this.detachSource = detachNewSource;
+    this.sourceAttached = true;
+  }
+
+  getState(): LayerShellOverlayState {
+    return {
+      ...this.controller.getState(),
+      sourceAttached: this.sourceAttached,
+      ...(this.renderError && { renderError: this.renderError })
+    };
+  }
   getCapabilities(): LayerShellCapabilities { return getLayerShellCapabilities(); }
-  close(): void { this.controller.close(); }
+  close(): void {
+    if (this.closed) return;
+    this.closed = true;
+    this.detachSource?.();
+    this.controller.close();
+  }
 }
 
 export async function createLayerShellOverlay(

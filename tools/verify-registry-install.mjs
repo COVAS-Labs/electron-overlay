@@ -36,6 +36,8 @@ import assert from "node:assert/strict";
 const overlay = await import(${JSON.stringify(packageName)});
 assert.equal(typeof overlay.configure, "function");
 assert.equal(typeof overlay.createLayerShellOverlay, "function");
+assert.equal(typeof overlay.LayerShellOverlayController.prototype.attachOffscreenWindow, "function");
+assert.equal(overlay.getLayerShellCapabilities().renderingMode, "electron-offscreen");
 try {
   assert.equal(overlay.findWindow({ title: "__electron_overlay_registry_validation__", match: "exact" }), null);
 } catch (error) {
@@ -46,6 +48,9 @@ if (process.platform === "linux") {
   const consumerRequire = createRequire(import.meta.url);
   const layerShell = consumerRequire(${JSON.stringify(`${prebuiltName}/wayland_layer_shell.node`)});
   assert.equal(typeof layerShell.createLayerShellOverlay, "function");
+  const controller = layerShell.createLayerShellOverlay({});
+  assert.equal(typeof controller.submitFrame, "function");
+  controller.close();
 }
 console.log("Loaded the installed native addon through findWindow for ${targetId}.");
 `.trimStart(), "utf8");
