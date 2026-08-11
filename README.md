@@ -56,6 +56,12 @@ npm run demo -- --demo=parent-transition
 npm run demo -- --demo=coordinates
 ```
 
+In Windows PowerShell, invoke the `npm.cmd` shim so arguments after `--` reach Electron:
+
+```powershell
+npm.cmd run demo -- --demo=policy
+```
+
 See [`packages/demo/README.md`](packages/demo/README.md) for the layer-shell command and screenshot contract.
 
 Run all visual scenarios in a disposable Linux x64 OrbStack machine:

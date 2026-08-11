@@ -35,6 +35,7 @@ app.whenReady().then(() => {
     transparent: true,
     backgroundColor: "#00000000",
     focusable: false,
+    resizable: false,
     show: false
   });
 
@@ -57,11 +58,14 @@ app.whenReady().then(() => {
   overlay.setClickThrough(true);
   overlay.setAlwaysOnTop(false);
   overlay.setAlwaysOnTop(true);
+  const resizedBounds = { ...bounds, x: bounds.x + 24, y: bounds.y + 24, width: 360, height: 220 };
+  overlay.setBounds(resizedBounds);
   window.showInactive();
   overlay.reapply();
 
   const state = overlay.getState();
-  if (state.closed || state.bounds.width !== 320 || state.bounds.height !== 180) {
+  if (state.closed || state.bounds.x !== resizedBounds.x || state.bounds.y !== resizedBounds.y
+      || state.bounds.width !== resizedBounds.width || state.bounds.height !== resizedBounds.height) {
     throw new Error(`Unexpected overlay state: ${JSON.stringify(state, (_key, value) =>
       typeof value === "bigint" ? value.toString() : value)}`);
   }

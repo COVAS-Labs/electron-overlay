@@ -215,6 +215,10 @@ export interface ElectronBrowserWindowLike {
   isDestroyed?(): boolean;
 }
 
+interface ElectronScreenLike {
+  screenToDipRect(window: null, rect: NativeRect): NativeRect;
+}
+
 interface ControllerBackend {
   attachParent(query: WindowQuery, options?: ParentAttachOptions): ParentInfo | null;
   detachParent(): void;
@@ -1128,10 +1132,57 @@ class WaylandElectronController implements ControllerBackend {
   close(): void { this.state.closed = true; }
 }
 
+class Win32ElectronController implements ControllerBackend {
+  constructor(
+    private readonly controller: ControllerBackend,
+    private readonly window: ElectronBrowserWindowLike,
+    initialBounds?: NativeRect
+  ) {
+    const state = this.controller.getState();
+    if (initialBounds) this.applyElectronBounds(initialBounds);
+    else if (state.position === "parent" && state.parent) this.applyElectronBounds(state.parent.bounds);
+    this.window.setIgnoreMouseEvents(state.clickThrough);
+  }
+
+  private applyElectronBounds(bounds: NativeRect): void {
+    const require = createRequire(import.meta.url);
+    const electron = require("electron") as { screen?: ElectronScreenLike };
+    if (!electron.screen?.screenToDipRect) {
+      throw new Error("The Win32 backend requires Electron's screen.screenToDipRect().");
+    }
+    this.window.setBounds(validateRect(electron.screen.screenToDipRect(null, bounds)));
+  }
+
+  attachParent(query: WindowQuery, options: ParentAttachOptions = {}): ParentInfo | null {
+    const parent = this.controller.attachParent(query, options);
+    if (parent && options.reposition) this.applyElectronBounds(parent.bounds);
+    return parent;
+  }
+  detachParent(): void { this.controller.detachParent(); }
+  setBounds(bounds: NativeRect): void {
+    this.controller.setBounds(bounds);
+    this.applyElectronBounds(bounds);
+  }
+  useParentBounds(): boolean {
+    const adopted = this.controller.useParentBounds();
+    const parent = this.controller.getState().parent;
+    if (adopted && parent) this.applyElectronBounds(parent.bounds);
+    return adopted;
+  }
+  setClickThrough(enabled: boolean): void {
+    this.controller.setClickThrough(enabled);
+    this.window.setIgnoreMouseEvents(enabled);
+  }
+  setAlwaysOnTop(enabled: boolean): void { this.controller.setAlwaysOnTop(enabled); }
+  reapply(): void { this.controller.reapply(); }
+  getState(): OverlayState { return this.controller.getState(); }
+  close(): void { this.controller.close(); }
+}
+
 class NativeAddonBackend implements OverlayBackend {
   readonly capabilities: OverlayCapabilities;
 
-  constructor(kind: "win32" | "macos" | "x11") {
+  constructor(private readonly kind: "win32" | "macos" | "x11") {
     if (kind === "x11" && process.platform !== "linux") {
       throw new Error("The x11 backend is only available on Linux.");
     }
@@ -1145,7 +1196,10 @@ class NativeAddonBackend implements OverlayBackend {
     }
     const nativeOptions = { ...options };
     delete nativeOptions.backend;
-    return loadAddon().configure(nativeWindowHandle, nativeOptions);
+    const controller = loadAddon().configure(nativeWindowHandle, nativeOptions);
+    return this.kind === "win32" && isBrowserWindowLike(target)
+      ? new Win32ElectronController(controller, target, options.position === "bounds" ? options.bounds : undefined)
+      : controller;
   }
 
   findWindow(query: WindowQuery): ParentInfo | null {

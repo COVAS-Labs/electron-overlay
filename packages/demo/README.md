@@ -44,6 +44,12 @@ npm run demo -- --demo=input-blocking
 npm run demo -- --demo=coordinates
 ```
 
+In Windows PowerShell, use the executable shim explicitly so PowerShell does not consume the arguments after `--`:
+
+```powershell
+npm.cmd run demo -- --demo=policy
+```
+
 Linux defaults to X11 unless it detects a native Wayland-only session. The backend can be fixed for a VM:
 
 ```sh

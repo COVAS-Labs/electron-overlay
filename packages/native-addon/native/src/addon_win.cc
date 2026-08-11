@@ -262,6 +262,12 @@ class Win32Overlay : public Napi::ObjectWrap<Win32Overlay> {
     std::unique_ptr<Init> init(info[0].As<Napi::External<Init>>().Data());
     overlay_ = init->overlay;
     config_ = std::move(init->config);
+    SetLastError(ERROR_SUCCESS);
+    const LONG_PTR styles = GetWindowLongPtrW(overlay_, GWL_EXSTYLE);
+    if (styles == 0 && GetLastError() != ERROR_SUCCESS) {
+      throw Napi::Error::New(info.Env(), "Could not read the initial Win32 overlay window styles.");
+    }
+    preserve_layered_style_ = (styles & WS_EX_LAYERED) != 0;
     if (config_.parent_query) parent_ = FindParent(*config_.parent_query);
     Apply(true, info.Env());
   }
@@ -277,7 +283,7 @@ class Win32Overlay : public Napi::ObjectWrap<Win32Overlay> {
   void Move(const Rect& bounds, Napi::Env env) {
     const HWND placement = config_.always_on_top ? HWND_TOPMOST : HWND_NOTOPMOST;
     if (!SetWindowPos(overlay_, placement, bounds.x, bounds.y, static_cast<int>(bounds.width),
-                      static_cast<int>(bounds.height), SWP_NOACTIVATE)) {
+                      static_cast<int>(bounds.height), SWP_NOACTIVATE | SWP_NOSENDCHANGING)) {
       throw Napi::Error::New(env, "Could not position the Win32 overlay window.");
     }
   }
@@ -290,8 +296,12 @@ class Win32Overlay : public Napi::ObjectWrap<Win32Overlay> {
     }
     styles |= WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE;
     styles &= ~static_cast<LONG_PTR>(WS_EX_APPWINDOW);
-    if (config_.click_through) styles |= WS_EX_TRANSPARENT;
-    else styles &= ~static_cast<LONG_PTR>(WS_EX_TRANSPARENT);
+    if (config_.click_through) {
+      styles |= WS_EX_TRANSPARENT | WS_EX_LAYERED;
+    } else {
+      styles &= ~static_cast<LONG_PTR>(WS_EX_TRANSPARENT);
+      if (!preserve_layered_style_) styles &= ~static_cast<LONG_PTR>(WS_EX_LAYERED);
+    }
 
     SetLastError(ERROR_SUCCESS);
     const LONG_PTR previous = SetWindowLongPtrW(overlay_, GWL_EXSTYLE, styles);
@@ -409,6 +419,7 @@ class Win32Overlay : public Napi::ObjectWrap<Win32Overlay> {
   HWND overlay_ = nullptr;
   Config config_;
   std::optional<ParentInfo> parent_;
+  bool preserve_layered_style_ = false;
   bool closed_ = false;
 };
 
