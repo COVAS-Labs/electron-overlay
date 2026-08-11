@@ -406,7 +406,16 @@ class Win32Overlay : public Napi::ObjectWrap<Win32Overlay> {
     }
     state.Set("bounds", RectObject(info.Env(), bounds));
     state.Set("position", config_.position_parent ? "parent" : "bounds");
-    state.Set("clickThrough", config_.click_through);
+    bool click_through = config_.click_through;
+    if (!closed_) {
+      SetLastError(ERROR_SUCCESS);
+      const LONG_PTR styles = GetWindowLongPtrW(overlay_, GWL_EXSTYLE);
+      if (styles == 0 && GetLastError() != ERROR_SUCCESS) {
+        throw Napi::Error::New(info.Env(), "Could not inspect the Win32 overlay input styles.");
+      }
+      click_through = (styles & WS_EX_TRANSPARENT) != 0 && (styles & WS_EX_LAYERED) != 0;
+    }
+    state.Set("clickThrough", click_through);
     state.Set("alwaysOnTop", config_.always_on_top);
     state.Set("preserveCompositing", config_.preserve_compositing);
     state.Set("allWorkspaces", config_.all_workspaces);

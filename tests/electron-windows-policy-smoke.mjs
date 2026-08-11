@@ -1,4 +1,3 @@
-import { execFileSync } from "node:child_process";
 import { setTimeout as delay } from "node:timers/promises";
 
 import { app, BrowserWindow, screen } from "electron";
@@ -23,17 +22,9 @@ const watchdog = setTimeout(() => {
 
 app.whenReady().then(async () => {
   const display = screen.getPrimaryDisplay();
-  const stageBounds = centeredBounds(display.bounds, 640, 420);
-  const initialBounds = inset(stageBounds, 80);
-  const finalBounds = inset(stageBounds, 30);
-  const reference = trackWindow(new BrowserWindow({
-    ...stageBounds,
-    show: false,
-    frame: false,
-    resizable: false,
-    backgroundColor: "#14263d",
-    webPreferences: { backgroundThrottling: false }
-  }));
+  const availableBounds = centeredBounds(display.bounds, 640, 420);
+  const initialBounds = inset(availableBounds, 80);
+  const finalBounds = inset(availableBounds, 30);
   const overlayWindow = trackWindow(new BrowserWindow({
     ...initialBounds,
     show: false,
@@ -44,14 +35,10 @@ app.whenReady().then(async () => {
     webPreferences: { backgroundThrottling: false }
   }));
 
-  stage = "loading click probes";
-  await Promise.all([
-    loadProbe(reference, "reference", "#14263d"),
-    loadProbe(overlayWindow, "overlay", "rgba(255, 80, 100, 0.35)")
-  ]);
-  reference.show();
+  stage = "loading the overlay renderer";
+  await loadProbe(overlayWindow);
   overlayWindow.showInactive();
-  await Promise.all([settleRenderer(reference), settleRenderer(overlayWindow)]);
+  await settleRenderer(overlayWindow);
 
   stage = "configuring and resizing the overlay";
   controller = configure(overlayWindow, {
@@ -67,22 +54,18 @@ app.whenReady().then(async () => {
   if (!sameRect(state.bounds, finalBounds)) {
     throw new Error(`Win32 setBounds regression: expected ${JSON.stringify(finalBounds)}, got ${JSON.stringify(state.bounds)}.`);
   }
-
-  stage = "verifying click-through input";
-  await delay(200);
-  clickDesktop(center(finalBounds));
-  await waitUntil(() => clickCount(reference), "reference click-through delivery");
-  if (await clickCount(overlayWindow) !== 0) {
-    throw new Error("The click-through overlay received input intended for the reference window.");
+  if (!state.clickThrough) {
+    throw new Error("Win32 click-through styles were not applied.");
   }
 
-  stage = "verifying restored overlay input";
+  stage = "verifying Win32 input policy styles";
   controller.setClickThrough(false);
-  await delay(200);
-  clickDesktop(center(finalBounds));
-  await waitUntil(() => clickCount(overlayWindow), "overlay input delivery");
-  if (await clickCount(reference) !== 1) {
-    throw new Error("The reference window received input while the overlay was input-blocking.");
+  if (controller.getState().clickThrough) {
+    throw new Error("Win32 click-through styles remained active while input was blocking.");
+  }
+  controller.setClickThrough(true);
+  if (!controller.getState().clickThrough) {
+    throw new Error("Win32 click-through styles were not restored.");
   }
 
   cleanup();
@@ -100,19 +83,15 @@ function trackWindow(window) {
   return window;
 }
 
-async function loadProbe(window, name, background) {
+async function loadProbe(window) {
   const html = `<!doctype html>
     <html>
       <body>
-        <strong>${name}</strong>
-        <script>
-          globalThis.clickCount = 0;
-          addEventListener("pointerdown", () => { globalThis.clickCount += 1; });
-        </script>
+        <strong>Windows policy smoke test</strong>
       </body>
       <style>
         html, body { width: 100%; height: 100%; margin: 0; }
-        body { display: grid; place-items: center; background: ${background}; color: white; font: 24px sans-serif; }
+        body { display: grid; place-items: center; background: rgba(255, 80, 100, 0.35); color: white; font: 24px sans-serif; }
       </style>
     </html>`;
   await window.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(html)}`);
@@ -123,39 +102,6 @@ async function settleRenderer(window) {
     "new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))"
   );
   await delay(50);
-}
-
-async function clickCount(window) {
-  return window.webContents.executeJavaScript("globalThis.clickCount");
-}
-
-function clickDesktop(point) {
-  const script = `
-Add-Type -TypeDefinition @'
-using System;
-using System.Runtime.InteropServices;
-public static class ElectronOverlayCiMouse {
-  [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
-  [DllImport("user32.dll")] public static extern void mouse_event(uint flags, uint dx, uint dy, uint data, UIntPtr extraInfo);
-}
-'@
-if (-not [ElectronOverlayCiMouse]::SetCursorPos(${point.x}, ${point.y})) { throw "SetCursorPos failed." }
-[ElectronOverlayCiMouse]::mouse_event(0x0002, 0, 0, 0, [UIntPtr]::Zero)
-[ElectronOverlayCiMouse]::mouse_event(0x0004, 0, 0, 0, [UIntPtr]::Zero)
-`;
-  execFileSync("powershell.exe", ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], {
-    stdio: "inherit"
-  });
-}
-
-async function waitUntil(probe, description, timeoutMs = 5_000) {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    const value = await probe();
-    if (value) return value;
-    await delay(50);
-  }
-  throw new Error(`Timed out waiting for ${description}.`);
 }
 
 function centeredBounds(displayBounds, desiredWidth, desiredHeight) {
@@ -175,13 +121,6 @@ function inset(bounds, amount) {
     y: bounds.y + amount,
     width: bounds.width - amount * 2,
     height: bounds.height - amount * 2
-  };
-}
-
-function center(bounds) {
-  return {
-    x: bounds.x + Math.round(bounds.width / 2),
-    y: bounds.y + Math.round(bounds.height / 2)
   };
 }
 

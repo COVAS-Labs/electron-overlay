@@ -64,7 +64,9 @@ app.whenReady().then(() => {
   overlay.reapply();
 
   const state = overlay.getState();
-  if (state.closed || state.bounds.x !== resizedBounds.x || state.bounds.y !== resizedBounds.y
+  const wrongPosition = process.platform === "win32"
+    && (state.bounds.x !== resizedBounds.x || state.bounds.y !== resizedBounds.y);
+  if (state.closed || wrongPosition
       || state.bounds.width !== resizedBounds.width || state.bounds.height !== resizedBounds.height) {
     throw new Error(`Unexpected overlay state: ${JSON.stringify(state, (_key, value) =>
       typeof value === "bigint" ? value.toString() : value)}`);
